@@ -44,6 +44,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 @main
+enum Main {
+    static func main() {
+        Updater.handleCommandLineIfRequested()   // `--update [--check]`
+        STTTransApp.main()
+    }
+}
+
 struct STTTransApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var model = AppModel()
