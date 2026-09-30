@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>Tongyeok</string>
+	<key>CFBundleExecutable</key>
+	<string>Tongyeok</string>
+	<key>CFBundleIdentifier</key>
+	<string>net.jioh.stttrans</string>
+	<key>CFBundleName</key>
+	<string>Tongyeok</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>26.0</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>시스템 오디오를 인식하기 위해 사용합니다.</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>실시간 음성 인식을 위해 마이크를 사용합니다.</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>온디바이스 음성 인식을 사용합니다.</string>
+	<key>UpdateAssetPrefix</key>
+	<string>tongyeok</string>
+	<key>UpdateRepo</key>
+	<string>ziozzang/tongyeok</string>
+</dict>
+</plist>
