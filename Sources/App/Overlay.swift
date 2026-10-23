@@ -240,8 +240,12 @@ struct SubtitleOverlay: View {
         let pending: Bool         // translation queued / streaming
     }
 
-    /// Windowed: the chosen number of lines. Full screen has room for more history.
-    private var lineCount: Int { max(1, controller.isFullScreen ? max(model.overlayLines, 12) : model.overlayLines) }
+    /// Auto (0): enough history to fill any window/screen; bottom-anchoring + clipping shows what fits.
+    /// A fixed count is honored as-is (full screen at least 12 so the screen isn't mostly empty).
+    private var lineCount: Int {
+        if model.overlayLines <= 0 { return 40 }
+        return controller.isFullScreen ? max(model.overlayLines, 12) : model.overlayLines
+    }
 
     private var lines: [Line] {
         var out = model.segments.suffix(lineCount).map { seg in
@@ -310,7 +314,8 @@ struct SubtitleOverlay: View {
                 ForEach(OverlayLayout.allCases) { Text($0.rawValue).tag($0.rawValue) }
             }
             Picker("줄 수", selection: $model.overlayLines) {
-                ForEach(1...4, id: \.self) { Text("\($0)줄").tag($0) }
+                Text("자동 (창 크기에 맞춤)").tag(0)
+                ForEach(1...6, id: \.self) { Text("\($0)줄").tag($0) }
             }
             Button("글자 크게") { model.overlayFontSize = min(96, model.overlayFontSize + 2) }
             Button("글자 작게") { model.overlayFontSize = max(14, model.overlayFontSize - 2) }

@@ -726,7 +726,10 @@ struct SettingsView: View {
                 Section("자막 창 (⌘T)") {
                     HStack { Text("글자 크기 \(Int(model.overlayFontSize)) pt (⌥⌘= / ⌥⌘-)"); Slider(value: $model.overlayFontSize, in: 14...96, step: 1) }
                     HStack { Text("전체 화면 배율 ×\(model.overlayFullScreenScale, specifier: "%.1f") (⌘⇧F, 더블클릭)"); Slider(value: $model.overlayFullScreenScale, in: 1...3, step: 0.1) }
-                    Stepper("표시 줄 수: \(model.overlayLines)", value: $model.overlayLines, in: 1...4)
+                    Picker("표시 줄 수", selection: $model.overlayLines) {
+                        Text("자동 (창 크기에 맞춤)").tag(0)
+                        ForEach(1...6, id: \.self) { Text("\($0)줄").tag($0) }
+                    }
                     HStack { Text("배경 불투명도 \(Int(model.overlayOpacity * 100))%"); Slider(value: $model.overlayOpacity, in: 0...1) }
                     Picker("배치", selection: $model.overlayLayoutRaw) {
                         ForEach(OverlayLayout.allCases) { Text($0.rawValue).tag($0.rawValue) }

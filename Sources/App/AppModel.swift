@@ -68,7 +68,8 @@ final class AppModel: ObservableObject {
     @AppStorage("overlayFullScreenScale") var overlayFullScreenScale = 1.6
     @AppStorage("overlayVisible") var overlayVisible = false
     @AppStorage("overlayFontSize") var overlayFontSize = 28.0
-    @AppStorage("overlayLines") var overlayLines = 2
+    /// 0 = auto: as many recent lines as fit the window (the rest fade out at the top).
+    @AppStorage("overlayRows") var overlayLines = 0
     @AppStorage("overlayLayout") var overlayLayoutRaw = OverlayLayout.sideBySide.rawValue
     var overlayLayout: OverlayLayout { OverlayLayout(rawValue: overlayLayoutRaw) ?? .sideBySide }
     @AppStorage("overlayOpacity") var overlayOpacity = 0.55
