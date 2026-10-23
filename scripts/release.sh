@@ -13,6 +13,24 @@ pb() { /usr/libexec/PlistBuddy -c "$1" "$PLIST"; }
 REPO=$(pb "Print :UpdateRepo"); PREFIX=$(pb "Print :UpdateAssetPrefix"); NAME=$(pb "Print :CFBundleName")
 [[ -z "$(git status --porcelain)" ]] || { echo "working tree not clean — commit first" >&2; exit 1; }
 
+# Releases must be signed with the pinned certificate: an ad-hoc or other-certificate release would reset every
+# user's microphone / screen-recording / Keychain permissions, and the in-app updater refuses a different cert.
+SIGN_ID="${TONGYEOK_SIGN_ID:-Tongyeok Signing}"
+PIN_FILE=Resources/signing-cert.sha256
+leaf_sha256() {   # SHA-256 of the leaf signing certificate of an .app ("" when ad-hoc)
+  local d=$(mktemp -d)
+  codesign -d --extract-certificates="$d/c" "$1" 2>/dev/null || true
+  [[ -f "$d/c0" ]] && shasum -a 256 "$d/c0" | awk '{print $1}'
+  rm -rf "$d"
+}
+if [[ -n "${TONGYEOK_ALLOW_ADHOC:-}" ]]; then
+  echo "⚠ TONGYEOK_ALLOW_ADHOC set: releasing without the pinned certificate check" >&2
+else
+  security find-identity -p codesigning 2>/dev/null | grep -qF "\"$SIGN_ID\"" \
+    || { echo "code-signing identity '$SIGN_ID' not found (see README: Signing certificate)" >&2; exit 1; }
+  [[ -s "$PIN_FILE" ]] || { echo "$PIN_FILE missing — build once, then: scripts/pin-cert.sh" >&2; exit 1; }
+fi
+
 TOKEN="${GITHUB_TOKEN:-$(grep -E '^(export )?GITHUB_TOKEN=' ~/env 2>/dev/null | head -1 | sed -E "s/^(export )?GITHUB_TOKEN=//; s/^[\"']//; s/[\"']\$//")}"
 [[ -n "$TOKEN" ]] || { echo "GITHUB_TOKEN not set" >&2; exit 1; }
 HDR=$(mktemp); PASS=$(mktemp); ASK=$(mktemp); chmod 600 "$HDR" "$PASS"; chmod 700 "$ASK"
@@ -50,6 +68,15 @@ echo "▶ $NAME v$VERSION → $REPO"
 pb "Set :CFBundleShortVersionString $VERSION"
 pb "Set :CFBundleVersion $(( $(pb 'Print :CFBundleVersion') + 1 ))"
 ./build.sh release
+if [[ -z "${TONGYEOK_ALLOW_ADHOC:-}" ]]; then
+  GOT=$(leaf_sha256 "build/$NAME.app")
+  if [[ "$GOT" != "$(tr -d ' \n' < "$PIN_FILE")" ]]; then
+    git checkout -- "$PLIST"   # undo the version bump
+    echo "release build is signed with ${GOT:-no certificate (ad-hoc)}, not the certificate pinned in $PIN_FILE" >&2
+    exit 1
+  fi
+  echo "  signed with pinned certificate ${GOT:0:16}…"
+fi
 
 mkdir -p dist
 rm -f "dist/$ZIP" dist/SHA256SUMS

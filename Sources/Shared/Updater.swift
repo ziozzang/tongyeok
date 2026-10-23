@@ -1,6 +1,7 @@
 import AppKit
 import CryptoKit
 import Foundation
+import Security
 import SwiftUI
 
 /// GitHub-Releases self-updater (same scheme as ziozzang/sugyeol):
@@ -174,6 +175,7 @@ final class Updater: ObservableObject {
                 .first(where: { $0.pathExtension == "app" }) else { throw UpdateError("No .app in the update archive") }
         let newVersion = Bundle(url: newApp)?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
         guard newVersion == rel.version else { throw UpdateError("Archive contains version \(newVersion ?? "?"), expected \(rel.version)") }
+        try SigningCheck.verifyUpdate(newApp, replacing: appURL)
         // Stage next to the current app (same volume → atomic rename).
         let staged = parent.appendingPathComponent(".\(appURL.lastPathComponent).update")
         try? FileManager.default.removeItem(at: staged)
@@ -323,4 +325,40 @@ struct UpdatePrompt: ViewModifier {
 
 extension View {
     func updatePrompt() -> some View { modifier(UpdatePrompt()) }
+}
+
+/// Second line of defence after SHA-256 (which only proves the zip matches the release's own checksum file):
+/// an update must be signed by the same certificate as the running app -- i.e. satisfy its designated
+/// requirement (bundle id + certificate). A compromised release could ship matching checksums, not our key.
+enum SigningCheck {
+    static func verifyUpdate(_ new: URL, replacing current: URL) throws {
+        guard let newCode = staticCode(new) else { throw Updater.UpdateError("Update has no readable code signature") }
+        // Intact signature (sealed resources, nested code) regardless of who signed it.
+        let flags = SecCSFlags(rawValue: kSecCSCheckAllArchitectures | kSecCSCheckNestedCode | kSecCSStrictValidate)
+        let integrity = SecStaticCodeCheckValidity(newCode, flags, nil)
+        guard integrity == errSecSuccess else { throw Updater.UpdateError("Update signature is broken (\(integrity))") }
+        // Ad-hoc running app: its requirement is just its own hash -- nothing to pin to yet (first signed release).
+        guard let cur = staticCode(current), !isAdHoc(cur) else { return }
+        var req: SecRequirement?
+        guard SecCodeCopyDesignatedRequirement(cur, [], &req) == errSecSuccess, let req else {
+            throw Updater.UpdateError("Cannot read this app's signing requirement")
+        }
+        let same = SecStaticCodeCheckValidity(newCode, flags, req)
+        guard same == errSecSuccess else {
+            throw Updater.UpdateError("Update is signed with a different certificate — refusing to install (\(same))")
+        }
+    }
+
+    static func staticCode(_ url: URL) -> SecStaticCode? {
+        var code: SecStaticCode?
+        return SecStaticCodeCreateWithPath(url as CFURL, [], &code) == errSecSuccess ? code : nil
+    }
+
+    static func isAdHoc(_ code: SecStaticCode) -> Bool {
+        var info: CFDictionary?
+        guard SecCodeCopySigningInformation(code, SecCSFlags(rawValue: kSecCSSigningInformation), &info) == errSecSuccess,
+              let d = info as? [String: Any] else { return true }
+        let flags = (d[kSecCodeInfoFlags as String] as? UInt32) ?? 0
+        return flags & SecCodeSignatureFlags.adhoc.rawValue != 0 || (d[kSecCodeInfoCertificates as String] as? [Any] ?? []).isEmpty
+    }
 }

@@ -51,8 +51,8 @@ The in-app updater clears the flag on updates itself.
 
 ### Permission prompts after an update
 
-macOS ties privacy permissions to the app's code signature, and an ad-hoc signature changes with every build.
-So after an update you may be asked again for:
+macOS ties privacy permissions to the app's code signature. Releases signed with the project's fixed certificate
+keep them across updates; an ad-hoc signed build (or the first update from an ad-hoc version) asks again for:
 
 - **Microphone**, and **Screen & System Audio Recording** (system audio input) — allow, then restart the app if
   system audio stays silent (System Settings → Privacy & Security → Screen & System Audio Recording);
@@ -69,6 +69,24 @@ release's `SHA256SUMS`, installed in place and the app relaunches. Set `NO_UPDAT
 Command line: `Tongyeok.app/Contents/MacOS/Tongyeok --update [--check]`.
 
 ## Build & release
+
+### Signing certificate (maintainers)
+
+Builds are signed with a self-signed **code-signing** certificate named `Tongyeok Signing` (override with
+`TONGYEOK_SIGN_ID`). Its designated requirement (bundle id + certificate) stays the same across builds, so users'
+microphone / screen-recording / Keychain permissions survive updates, and the in-app updater refuses an update
+signed by anything else. Without the certificate `build.sh` falls back to ad-hoc signing (with a warning) and
+`release.sh` refuses to publish.
+
+1. Keychain Access → Certificate Assistant → Create a Certificate… — Name `Tongyeok Signing`, Identity Type
+   *Self-Signed Root*, Certificate Type *Code Signing*, **Let me override defaults** → validity 7300 days.
+2. Double-click it → Trust → Code Signing: *Always Trust*.
+3. Export it as a password-protected `.p12` and keep it somewhere safe. Never commit it: whoever has the key can
+   sign apps that inherit Tongyeok's permissions and Keychain access. A new certificate resets everyone's
+   permissions once (and needs a release that the old updater accepts — see `SigningCheck`).
+4. `./build.sh && scripts/pin-cert.sh`, then commit `Resources/signing-cert.sha256` (the public fingerprint
+   `release.sh` checks every release build against).
+
 
 ```sh
 ./build.sh                         # → build/Tongyeok.app  (plain swiftc, no Xcode project)
