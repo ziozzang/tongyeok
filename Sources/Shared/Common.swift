@@ -79,3 +79,29 @@ enum AppError: LocalizedError {
         }
     }
 }
+
+/// LiteLLM proxy credentials from `~/env` (KEY=value lines, optional `export`, quotes) or the environment.
+struct LiteLLMEnv {
+    let baseURL: String
+    let apiKey: String
+
+    static func load(file: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("env")) -> LiteLLMEnv? {
+        var vars = ProcessInfo.processInfo.environment
+        if let text = try? String(contentsOf: file, encoding: .utf8) {
+            for raw in text.split(whereSeparator: \.isNewline) {
+                var line = raw.trimmingCharacters(in: .whitespaces)
+                if line.hasPrefix("#") { continue }
+                if line.hasPrefix("export ") { line.removeFirst(7) }
+                guard let eq = line.firstIndex(of: "=") else { continue }
+                let key = line[..<eq].trimmingCharacters(in: .whitespaces)
+                var value = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+                if value.count >= 2, let f = value.first, f == value.last, f == "\"" || f == "'" {
+                    value = String(value.dropFirst().dropLast())
+                }
+                if key.hasPrefix("LITELLM_") { vars[key] = value }
+            }
+        }
+        guard let base = vars["LITELLM_OPENAI_BASE_URL"], !base.isEmpty else { return nil }
+        return LiteLLMEnv(baseURL: base, apiKey: vars["LITELLM_OPENAI_API_KEY"] ?? "")
+    }
+}

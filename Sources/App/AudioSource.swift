@@ -12,6 +12,7 @@ enum InputKind: String, CaseIterable, Identifiable {
     case microphone = "마이크"
     case systemAudio = "시스템 소리"
     var id: String { rawValue }
+    var symbol: String { self == .microphone ? "mic" : "speaker.wave.2" }
 }
 
 // MARK: - Microphone (AVAudioEngine)

@@ -11,6 +11,10 @@ Live speech recognition + translation for macOS — native, on-device speech rec
 - Two-way language auto-detect (e.g. EN⇄KO), ⇄ swap, pause / push-to-talk (Space)
 - LLM prompt carries user context + previous sentences for consistent terminology
 - Low-quality recording (AAC 32 kbps or AIFF, 16 kHz mono)
+- Floating subtitle window (⌘T): original | translation side by side, resizable, click-through, full screen (⌘⇧F / double-click)
+- Speech recognition: Apple on-device, or Whisper via any OpenAI-compatible `/audio/transcriptions` (LiteLLM etc.)
+- Experimental speaker labels by voice (CAM++ CoreML embedding, ~17 MB, downloaded on first use)
+- LiteLLM endpoint/key auto-filled from `~/env` (`LITELLM_OPENAI_BASE_URL`, `LITELLM_OPENAI_API_KEY`)
 
 ## Install
 
@@ -42,4 +46,10 @@ xcrun swiftc -O -target arm64-apple-macosx26.0 -o build/cli Tests/cli/main.swift
   Sources/App/{SpeechEngine,AudioSource}.swift Sources/Shared/{Common,Translator,SentenceAssembler,VAD}.swift
 say -o /tmp/t.aiff "Hello everyone. [[slnc 1500]] Let's begin." && STTTRANS_DEBUG=1 build/cli /tmp/t.aiff en-US google ko
 ```
-Debug hooks: `STTTRANS_DEBUG=1`, `STTTRANS_AUTOSTART=1`, `STTTRANS_TEST_FILE=<audio>`.
+Speaker clustering check (labeled 16 kHz mono WAVs):
+```sh
+xcrun swiftc -O -target arm64-apple-macosx26.0 -o build/speakers Tests/speakers/main.swift \
+  Sources/Shared/{Speakers,Common,Translator}.swift && build/speakers Alice=a1.wav Bob=b1.wav Alice=a2.wav
+```
+Debug hooks: `STTTRANS_DEBUG=1`, `STTTRANS_AUTOSTART=1`, `STTTRANS_TEST_FILE=<audio>`,
+`STTTRANS_SNAPSHOT_DIR=<dir>` (PNG of each window every 2 s), `STTTRANS_OVERLAY_FULLSCREEN=1`.

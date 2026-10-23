@@ -8,7 +8,13 @@ final class SpeechEngine: @unchecked Sendable {
         var finalSegment: @Sendable (_ text: String, _ languageCode: String, _ startedAt: Date) -> Void
         var level: @Sendable (Float, Bool) -> Void
         var status: @Sendable (String) -> Void
+        /// Audio of each VAD utterance (16 kHz mono) with its wall-clock span, for speaker labeling.
+        var utterance: @Sendable (_ samples: [Float], _ start: Date, _ end: Date) -> Void = { _, _, _ in }
     }
+    /// Collect utterance audio for `Callbacks.utterance` (off by default: costs a copy of the speech audio).
+    var captureUtterances = false
+    private var utteranceSamples: [Float] = []
+    private var utteranceStart: Date?
 
     private enum Work { case speech(AVAudioPCMBuffer), segmentEnd }
     /// Silence fed after each segment: the model needs look-ahead audio to finish the last words.
@@ -260,7 +266,7 @@ final class SpeechEngine: @unchecked Sendable {
         lock.lock(); let open = gateOpen; lock.unlock()
         if !open {
             // Gate just closed mid-utterance: finalize what was said so far.
-            if gateWasOpen && vad.isSpeech { workCont?.yield(.segmentEnd) }
+            if gateWasOpen && vad.isSpeech { workCont?.yield(.segmentEnd); emitUtterance() }
             if gateWasOpen { vad.reset() }
             gateWasOpen = false
             emitLevel(db: EnergyVAD.rmsDB(mono), speech: false)
@@ -271,11 +277,32 @@ final class SpeechEngine: @unchecked Sendable {
         let events = vad.process(analysisBuffer: mono, forwardBuffer: converted)
         for e in events {
             switch e {
-            case .speech(let b): workCont?.yield(.speech(b))
-            case .segmentEnd: workCont?.yield(.segmentEnd)
+            case .speech(let b): workCont?.yield(.speech(b)); collectUtterance(b)
+            case .segmentEnd: workCont?.yield(.segmentEnd); emitUtterance()
             }
         }
         emitLevel(db: vad.levelDB, speech: vad.isSpeech)
+    }
+
+    private func collectUtterance(_ b: AVAudioPCMBuffer) {
+        guard captureUtterances, b.format.sampleRate == 16_000 else { return }
+        if utteranceStart == nil {
+            // First buffer is pre-roll, captured ~preRoll+onset ago.
+            utteranceStart = Date().addingTimeInterval(-(vad.config.preRollMs + vad.config.onsetMs) / 1000)
+        }
+        let n = Int(b.frameLength)
+        if let i = b.int16ChannelData {
+            utteranceSamples.append(contentsOf: UnsafeBufferPointer(start: i[0], count: n).map { Float($0) / 32_768 })
+        } else if let f = b.floatChannelData {
+            utteranceSamples.append(contentsOf: UnsafeBufferPointer(start: f[0], count: n))
+        }
+    }
+
+    private func emitUtterance() {
+        guard captureUtterances, let start = utteranceStart else { return }
+        let audio = utteranceSamples
+        utteranceSamples = []; utteranceStart = nil
+        callbacks.utterance(audio, start, Date())
     }
 
     private func emitLevel(db: Float, speech: Bool) {
@@ -337,7 +364,11 @@ final class SpeechEngine: @unchecked Sendable {
         if lane.firstStart == nil, result.range.start.isNumeric { lane.firstStart = result.range.start }
         if result.isFinal {
             lane.lastFinalEnd = CMTimeMaximum(lane.lastFinalEnd, result.range.end)
-            if Self.letterCount(text) * 2 < Self.letterCount(lane.lastVolatile) {
+            // Final that lost its opening words (",.., can you send…" after "Great, Evan, can you send…").
+            let core = String(text.drop { $0.isPunctuation || $0.isWhitespace })
+            let vol = lane.lastVolatile.trimmingCharacters(in: .whitespaces)
+            let truncated = !core.isEmpty && core.count < vol.count && vol.lowercased().hasSuffix(core.lowercased())
+            if Self.letterCount(text) * 2 < Self.letterCount(lane.lastVolatile) || truncated {
                 dlog("degenerate final '\(text)' -> using volatile '\(lane.lastVolatile)'")
                 text = lane.lastVolatile
             } else {

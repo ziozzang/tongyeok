@@ -15,6 +15,7 @@ struct Segment: Identifiable, Equatable {
     var targetLang: String
     var translation: String = ""
     var state: State = .queued
+    var speaker: Int?        // 0-based voice cluster (speaker labeling), nil = unknown / off
     enum State: Equatable { case queued, translating, done, failed(String) }
 }
 
@@ -32,6 +33,14 @@ final class AppModel: ObservableObject {
     @AppStorage("llmHistory") var llmHistory = 6
     @AppStorage("llmSystemAsUser") var llmSystemAsUser = false
     @AppStorage("googleAPIKey") var googleAPIKey = ""
+    /// Voice-based speaker labeling (CAM++ embedding per utterance + online clustering).
+    @AppStorage("diarize") var diarize = false
+    @AppStorage("speakerThreshold") var speakerThreshold = 0.7
+    @AppStorage("sttEngine") var sttEngineRaw = STTEngineKind.apple.rawValue
+    var sttEngine: STTEngineKind { STTEngineKind(rawValue: sttEngineRaw) ?? .apple }
+    @AppStorage("whisperBaseURL") var whisperBaseURL = ""
+    @AppStorage("whisperAPIKey") var whisperAPIKey = ""
+    @AppStorage("whisperModel") var whisperModel = "openai/whisper-large-v3"
     @AppStorage("userContext") var userContext = ""
     @AppStorage("vadMargin") var vadMargin = 9.0
     @AppStorage("vadHangoverMs") var vadHangoverMs = 700.0
@@ -41,6 +50,21 @@ final class AppModel: ObservableObject {
     @AppStorage("sentenceMerge") var sentenceMerge = true
     @AppStorage("mergeHoldSec") var mergeHoldSec = 2.5
     @AppStorage("showTimestamps") var showTimestamps = true
+    // Fonts ("" = system font)
+    @AppStorage("fontFamily") var fontFamily = ""
+    @AppStorage("transcriptFontSize") var transcriptFontSize = 15.0
+    func font(_ size: Double, weight: Font.Weight = .regular) -> Font {
+        fontFamily.isEmpty ? .system(size: size, weight: weight) : .custom(fontFamily, size: size).weight(weight)
+    }
+    // Floating subtitle overlay
+    @AppStorage("overlayFullScreenScale") var overlayFullScreenScale = 1.6
+    @AppStorage("overlayVisible") var overlayVisible = false
+    @AppStorage("overlayFontSize") var overlayFontSize = 28.0
+    @AppStorage("overlayLines") var overlayLines = 2
+    @AppStorage("overlayLayout") var overlayLayoutRaw = OverlayLayout.sideBySide.rawValue
+    var overlayLayout: OverlayLayout { OverlayLayout(rawValue: overlayLayoutRaw) ?? .sideBySide }
+    @AppStorage("overlayOpacity") var overlayOpacity = 0.55
+    @AppStorage("overlayClickThrough") var overlayClickThrough = false
     /// Listen for both the source and target languages; translate each utterance into the other one.
     @AppStorage("autoDetect") var autoDetect = false
     @AppStorage("listenMode") var listenModeRaw = ListenMode.always.rawValue
@@ -94,7 +118,11 @@ final class AppModel: ObservableObject {
         if segments.isEmpty { reset() } else { confirmReset = true }
     }
 
-    private var engine: SpeechEngine?
+    private var engine: RecognitionEngine?
+    private var diarizer: Diarizer?
+    private static var embedder: SpeakerEmbedder?
+    /// Wall-clock spans of labeled utterances; recognized text is matched to them by start time.
+    private var speakerSpans: [(start: Date, end: Date, speaker: Int)] = []
     private var translateQueue: [UUID] = []
     private var translateTask: Task<Void, Never>?
     private var translator: Translator?
@@ -107,6 +135,39 @@ final class AppModel: ObservableObject {
     var recordFormat: RecordFormat { RecordFormat(rawValue: recordFormatRaw) ?? .m4a }
 
 
+    // MARK: LiteLLM (~/env)
+
+    /// Fills empty endpoint/key fields from `LITELLM_OPENAI_BASE_URL` / `LITELLM_OPENAI_API_KEY`
+    /// in ~/env (or the process environment). `overwrite` = the settings button.
+    @discardableResult
+    func loadLiteLLMEnv(overwrite: Bool = false) -> Bool {
+        guard let env = LiteLLMEnv.load() else {
+            if overwrite { lastError = "~/env 에서 LITELLM_OPENAI_BASE_URL 을 찾지 못했습니다." }
+            return false
+        }
+        if overwrite || llmBaseURL.isEmpty { llmBaseURL = env.baseURL; llmAPIKey = env.apiKey }
+        if overwrite || whisperBaseURL.isEmpty { whisperBaseURL = env.baseURL; whisperAPIKey = env.apiKey }
+        if overwrite { status = "LiteLLM 설정을 ~/env 에서 불러왔습니다." }
+        return true
+    }
+
+    /// Model ids served by an OpenAI-compatible endpoint (`GET /models`), for the settings pickers.
+    func fetchModels(baseURL: String, apiKey: String) async -> [String] {
+        var base = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        while base.hasSuffix("/") { base.removeLast() }
+        guard let url = URL(string: base + "/models") else { return [] }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 15
+        if !apiKey.isEmpty { req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
+        guard let (data, _) = try? await URLSession.shared.data(for: req),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let list = json["data"] as? [[String: Any]] else {
+            lastError = "모델 목록을 가져오지 못했습니다: \(url.absoluteString)"
+            return []
+        }
+        return list.compactMap { $0["id"] as? String }.sorted()
+    }
+
     // MARK: Control
 
     func toggle() { isRunning ? stop() : start() }
@@ -115,12 +176,18 @@ final class AppModel: ObservableObject {
         guard !isRunning, !isBusy else { return }
         isBusy = true
         lastError = nil
-        let engine = SpeechEngine(callbacks: .init(
+        let callbacks = SpeechEngine.Callbacks(
             volatile: { t in Task { @MainActor in self.volatileText = t } },
             finalSegment: { t, lang, at in Task { @MainActor in self.receive(t, lang: lang, at: at) } },
             level: { db, sp in Task { @MainActor in self.levelDB = db; self.isSpeech = sp } },
-            status: { s in Task { @MainActor in self.status = s } }
-        ))
+            status: { s in Task { @MainActor in self.status = s } },
+            utterance: { audio, s, e in Task { @MainActor in self.labelSpeaker(audio, start: s, end: e) } }
+        )
+        let engine: RecognitionEngine = switch sttEngine {
+        case .apple: SpeechEngine(callbacks: callbacks)
+        case .whisper: WhisperEngine(config: .init(baseURL: whisperBaseURL, apiKey: whisperAPIKey, model: whisperModel),
+                                     callbacks: callbacks)
+        }
         engine.setListening(isListening)
         var vad = EnergyVAD.Config()
         vad.marginDB = Float(vadMargin)
@@ -141,14 +208,17 @@ final class AppModel: ObservableObject {
         let input = inputKind
         Task {
             do {
+                if self.diarize { await self.prepareDiarizer() }
+                engine.captureUtterances = self.diarizer != nil
+                let src: AudioSource
                 if let testFile = ProcessInfo.processInfo.environment["STTTRANS_TEST_FILE"] {
                     // Debug hook: feed an audio file in real time instead of a live source.
-                    try await engine.start(source: FileSource(url: URL(fileURLWithPath: testFile)), languages: languages,
-                                           contextualStrings: terms, vadConfig: vad, recorder: recorder)
+                    src = FileSource(url: URL(fileURLWithPath: testFile))
                 } else {
-                    try await engine.start(input: input, languages: languages, contextualStrings: terms,
-                                           vadConfig: vad, recorder: recorder)
+                    src = input == .microphone ? MicrophoneSource() : SystemAudioSource()
                 }
+                try await engine.start(source: src, languages: languages, contextualStrings: terms,
+                                       vadConfig: vad, recorder: recorder)
                 self.engine = engine
                 self.isRunning = true
                 self.isPaused = false
@@ -205,6 +275,8 @@ final class AppModel: ObservableObject {
         segments.removeAll()
         volatileText = ""
         held = nil; heldText = ""; holdGeneration += 1; lastSoft = nil
+        speakerSpans.removeAll()
+        if let d = diarizer { Task { await d.reset() } }
         lastError = nil
         appleTranslator = AppleTranslator()
         if isRunning {
@@ -216,6 +288,47 @@ final class AppModel: ObservableObject {
             status = "리셋됨"
         }
     }
+
+    // MARK: Speakers
+
+    private func prepareDiarizer() async {
+        if diarizer == nil {
+            do {
+                if Self.embedder == nil { Self.embedder = try await SpeakerEmbedder.load { s in self.status = s } }
+                diarizer = Diarizer(embedder: Self.embedder!, threshold: Float(speakerThreshold))
+            } catch {
+                lastError = "화자 구분을 켤 수 없습니다: \(error.localizedDescription)"
+                return
+            }
+        }
+        await diarizer?.setThreshold(Float(speakerThreshold))
+    }
+
+    private func labelSpeaker(_ audio: [Float], start: Date, end: Date) {
+        guard let d = diarizer else { return }
+        Task {
+            guard let spk = await d.speaker(for: audio) else { return }
+            speakerSpans.append((start, end, spk))
+            if speakerSpans.count > 2000 { speakerSpans.removeFirst(500) }
+            // Text that arrived before its speaker was known.
+            for i in segments.indices.reversed() where segments[i].speaker == nil {
+                if segments[i].time < start.addingTimeInterval(-30) { break }
+                if speaker(at: segments[i].time) == spk { segments[i].speaker = spk }
+            }
+        }
+    }
+
+    /// Speaker of the utterance that was going on at `t` (recognizer times are approximate).
+    func speaker(at t: Date) -> Int? {
+        speakerSpans.last { $0.start.addingTimeInterval(-0.5) <= t && t <= $0.end.addingTimeInterval(0.3) }?.speaker
+    }
+
+    private func differentSpeakers(_ a: Date, _ b: Date) -> Bool {
+        guard let x = speaker(at: a), let y = speaker(at: b) else { return false }
+        return x != y
+    }
+
+    static func speakerLabel(_ i: Int) -> String { "화자 \(i + 1)" }
 
     // MARK: Translation pipeline (serial, ordered, context-aware)
 
@@ -231,10 +344,12 @@ final class AppModel: ObservableObject {
         guard !text.isEmpty else { return }
         guard sentenceMerge else { addSegment(text, lang: lang, at: at); return }
         if let h = held, h.lang != lang { emitHeld() }          // language switched: close previous
+        if let h = held, differentSpeakers(h.at, at) { emitHeld() }   // someone else is talking now
 
         // Retroactive merge: previous row ended with a period but this chunk continues it
         // ("...results." + "And decided..."), so fold it back in and retranslate.
         if held == nil, let soft = lastSoft, soft.lang == lang,
+           !differentSpeakers(segments.last?.time ?? at, at),
            Date().timeIntervalSince(soft.emittedAt) < 10,
            SentenceSplitter.isContinuation(text, lang: lang),
            let idx = segments.indices.last, segments[idx].id == soft.id {
@@ -303,11 +418,12 @@ final class AppModel: ObservableObject {
     private func addSegment(_ text: String, lang: String, at: Date) -> UUID {
         // Auto-detect: translate into whichever of the pair was NOT spoken.
         let target = autoDetect ? (lang == sourceCode ? targetCode : sourceCode) : targetCode
-        let seg = Segment(time: at, source: text, sourceLang: lang, targetLang: target)
+        var seg = Segment(time: at, source: text, sourceLang: lang, targetLang: target)
+        seg.speaker = speaker(at: at)
         segments.append(seg)
         translateQueue.append(seg.id)
         pumpTranslations()
-        dlog("ROW+ [\(lang)] \(text)")
+        dlog("ROW+ [\(lang)] spk=\(seg.speaker.map { "\($0 + 1)" } ?? "?") \(text)")
         return seg.id
     }
 
@@ -384,7 +500,8 @@ final class AppModel: ObservableObject {
 
     /// "[HH:mm:ss] " prefix for copied text (if enabled).
     func stampPrefix(_ seg: Segment) -> String {
-        copyTimestamps ? "[\(Self.timeFormatter.string(from: seg.time))] " : ""
+        (copyTimestamps ? "[\(Self.timeFormatter.string(from: seg.time))] " : "")
+            + (seg.speaker.map { Self.speakerLabel($0) + ": " } ?? "")
     }
 
     var sourceText: String { segments.map { stampPrefix($0) + $0.source }.joined(separator: "\n") }
@@ -405,7 +522,10 @@ final class AppModel: ObservableObject {
         let url = dir.appendingPathComponent("\(Self.stamp())-transcript.md")
         let f = DateFormatter(); f.dateFormat = "HH:mm:ss"
         var md = "# Transcript (\(source.label) → \(target.label))\n\n"
-        for s in segments { md += "**[\(f.string(from: s.time))]** \(s.source)\n\n> \(s.translation)\n\n" }
+        for s in segments {
+            let who = s.speaker.map { " \(Self.speakerLabel($0))" } ?? ""
+            md += "**[\(f.string(from: s.time))]\(who)** \(s.source)\n\n> \(s.translation)\n\n"
+        }
         try? md.write(to: url, atomically: true, encoding: .utf8)
         status = "저장됨: \(url.lastPathComponent)"
         NSWorkspace.shared.activateFileViewerSelecting([url])

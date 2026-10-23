@@ -63,6 +63,13 @@ struct STTTransApp: App {
                 .onAppear {
                     appDelegate.model = model
                     Updater.shared.startAutomaticChecks()
+                    if model.overlayVisible { OverlayController.shared.show(model: model) }
+                    // Debug hook: open the subtitle window full screen.
+                    if ProcessInfo.processInfo.environment["STTTRANS_OVERLAY_FULLSCREEN"] != nil {
+                        OverlayController.shared.toggleFullScreen(model: model)
+                    }
+                    model.loadLiteLLMEnv()   // only fills empty endpoint/key fields
+                    DebugSnapshots.startIfRequested()
                     // Debug hook: start listening on launch.
                     if ProcessInfo.processInfo.environment["STTTRANS_AUTOSTART"] != nil { model.start() }
                 }
@@ -79,6 +86,7 @@ struct STTTransApp: App {
 
 struct ContentView: View {
     @EnvironmentObject var model: AppModel
+    @ObservedObject private var overlay = OverlayController.shared
     @State private var appleConfig: TranslationSession.Configuration?
 
     var body: some View {
@@ -102,8 +110,9 @@ struct ContentView: View {
     }
 
     /// Custom control bar (NSToolbar hides items into an overflow menu when space runs out).
+    /// Sized to fit the 960 pt minimum window width: pickers show only their value (tooltips explain).
     var controlBar: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 8) {
             // Run control
             Button { model.toggle() } label: {
                 Label(model.isRunning ? "정지" : "시작",
@@ -118,70 +127,86 @@ struct ContentView: View {
 
             if model.isRunning && model.listenMode == .always {
                 Button { model.togglePause() } label: {
-                    Label(model.isPaused ? "재개" : "일시정지",
-                          systemImage: model.isPaused ? "play.fill" : "pause.fill")
+                    Image(systemName: model.isPaused ? "play.fill" : "pause.fill").frame(width: 16)
                 }
                 .controlSize(.large)
-                .help("일시정지/재개 (Space 또는 ⌘P) — 녹음은 계속됩니다")
+                .help(model.isPaused ? "재개 (Space 또는 ⌘P)" : "일시정지 (Space 또는 ⌘P) — 녹음은 계속됩니다")
             }
             VStack(alignment: .leading, spacing: 3) {
                 LevelMeter(db: model.levelDB, speech: model.isSpeech).frame(width: 90, height: 6)
                 if model.isRunning { ListeningBadge() } else { Text("대기").font(.caption).foregroundStyle(.secondary) }
             }
+            .frame(width: 96, alignment: .leading)
 
             Divider().frame(height: 22)
 
-            Picker("입력", selection: $model.inputKindRaw) {
-                ForEach(InputKind.allCases) { Text($0.rawValue).tag($0.rawValue) }
+            Group {
+                Picker("입력", selection: $model.inputKindRaw) {
+                    ForEach(InputKind.allCases) { Image(systemName: $0.symbol).help($0.rawValue).tag($0.rawValue) }
+                }
+                .pickerStyle(.segmented)
+                .help("입력: 마이크 · 시스템 소리 (인식 중에는 변경 불가)")
+
+                Picker("음성 인식", selection: $model.sttEngineRaw) {
+                    ForEach(STTEngineKind.allCases) { Text($0.short).tag($0.rawValue) }
+                }
+                .help("음성 인식 엔진: Apple(온디바이스, 실시간) · Whisper(API, 조금 늦지만 정확) — 인식 중에는 변경 불가")
             }
-            .pickerStyle(.segmented).labelsHidden().fixedSize()
             .disabled(model.isRunning)
-            .help("입력 소스 (인식 중에는 변경 불가)")
 
-            Picker(selection: $model.listenModeRaw) {
+            Picker("듣기", selection: $model.listenModeRaw) {
                 ForEach(ListenMode.allCases) { Text($0.rawValue).tag($0.rawValue) }
-            } label: { Image(systemName: "ear") }
-            .fixedSize()
+            }
             .onChange(of: model.listenModeRaw) { model.isPaused = false; model.pttHeld = false; model.updateGate() }
-            .help("상시: 계속 인식 (Space = 일시정지) · Space 누르는 동안: 누르고 있을 때만 인식")
+            .help("상시: 계속 인식 (Space = 일시정지) · 누를 때만: Space를 누르고 있을 때만 인식")
 
-            Picker(selection: $model.translatorRaw) {
+            Picker("번역", selection: $model.translatorRaw) {
                 ForEach(TranslatorKind.allCases) { Text($0.rawValue).tag($0.rawValue) }
-            } label: { Image(systemName: "globe") }
-            .fixedSize()
-            .help("번역 엔진: LLM(Gemma 등, OpenAI 호환) · Apple(온디바이스) · Google")
+            }
+            .help("번역 엔진: LLM(OpenAI 호환) · Apple(온디바이스) · Google")
             if model.translatorKind == .apple {
-                Button("언어 팩") {
+                Button {
                     let cfg = TranslationSession.Configuration(
                         source: Locale.Language(identifier: model.source.code),
                         target: Locale.Language(identifier: model.target.code))
                     if appleConfig == cfg { appleConfig?.invalidate() } else { appleConfig = cfg }
-                }
+                } label: { Image(systemName: "arrow.down.circle") }
                 .help("Apple 온디바이스 번역 언어 팩 다운로드")
             }
 
             Spacer(minLength: 8)
 
-            Toggle("자동 스크롤", isOn: $model.autoScroll)
-                .toggleStyle(.checkbox)
-                .help("새 문장이 오면 항상 맨 아래로 스크롤 (⌘J)")
-            Menu {
-                Button("원문 복사") { model.copy(model.sourceText) }
-                Button("번역 복사") { model.copy(model.translationText) }
-                Button("원문 + 번역 복사") { model.copy(model.bilingualText) }
-                Divider()
-                Toggle("시간 포함", isOn: $model.copyTimestamps)
-            } label: { Image(systemName: "doc.on.doc") }
-            .menuIndicator(.hidden).fixedSize()
-            .help("클립보드로 복사")
-            Button { model.saveTranscript() } label: { Image(systemName: "square.and.arrow.down") }
-                .help("대본을 Markdown으로 저장 (⌘S)")
-            Button { model.requestReset() } label: { Image(systemName: "arrow.counterclockwise") }
-                .help("리셋: 화면·번역 맥락 초기화, 인식 중이면 새 세션으로 재시작 (⌘K)")
-                .disabled(model.isBusy)
-            SettingsLink { Image(systemName: "gearshape") }
-                .help("설정 (⌘,)")
+            HStack(spacing: 4) {
+                Toggle(isOn: Binding(get: { overlay.isVisible }, set: { _ in OverlayController.shared.toggle(model: model) })) {
+                    Image(systemName: "captions.bubble")
+                }
+                .help("떠 있는 자막 창 (⌘T)")
+                Toggle(isOn: $model.autoScroll) { Image(systemName: "arrow.down.to.line") }
+                    .help("새 문장이 오면 항상 맨 아래로 스크롤 (⌘J)")
+            }
+            .toggleStyle(.button)
+
+            HStack(spacing: 4) {
+                Menu {
+                    Button("원문 복사") { model.copy(model.sourceText) }
+                    Button("번역 복사") { model.copy(model.translationText) }
+                    Button("원문 + 번역 복사") { model.copy(model.bilingualText) }
+                    Divider()
+                    Toggle("시간 포함", isOn: $model.copyTimestamps)
+                } label: { Image(systemName: "doc.on.doc") }
+                .menuIndicator(.hidden).fixedSize()
+                .help("클립보드로 복사")
+                Button { model.saveTranscript() } label: { Image(systemName: "square.and.arrow.down") }
+                    .help("대본을 Markdown으로 저장 (⌘S)")
+                Button { model.requestReset() } label: { Image(systemName: "arrow.counterclockwise") }
+                    .help("리셋: 화면·번역 맥락 초기화, 인식 중이면 새 세션으로 재시작 (⌘K)")
+                    .disabled(model.isBusy)
+                SettingsLink { Image(systemName: "gearshape") }
+                    .help("설정 (⌘,)")
+            }
         }
+        .labelsHidden()
+        .fixedSize(horizontal: false, vertical: true)
         .padding(.horizontal, 12).padding(.vertical, 8)
         .background(.bar)
     }
@@ -190,8 +215,27 @@ struct ContentView: View {
 /// Menu bar: 전사 menu with the same actions + shortcuts.
 struct TranscriptCommands: Commands {
     @ObservedObject var model: AppModel
+    @ObservedObject private var overlay = OverlayController.shared
     var body: some Commands {
         CommandGroup(replacing: .newItem) {}
+        CommandGroup(before: .toolbar) {
+            Button("글자 크게") { model.transcriptFontSize = min(32, model.transcriptFontSize + 1) }
+                .keyboardShortcut("=", modifiers: .command)
+            Button("글자 작게") { model.transcriptFontSize = max(10, model.transcriptFontSize - 1) }
+                .keyboardShortcut("-", modifiers: .command)
+            Button("기본 글자 크기") { model.transcriptFontSize = 15 }
+                .keyboardShortcut("0", modifiers: .command)
+            Divider()
+            Button("자막 글자 크게") { model.overlayFontSize = min(96, model.overlayFontSize + 2) }
+                .keyboardShortcut("=", modifiers: [.command, .option])
+            Button("자막 글자 작게") { model.overlayFontSize = max(14, model.overlayFontSize - 2) }
+                .keyboardShortcut("-", modifiers: [.command, .option])
+            Button(overlay.isFullScreen ? "자막 전체 화면 끝내기" : "자막 전체 화면") {
+                OverlayController.shared.toggleFullScreen(model: model)
+            }
+            .keyboardShortcut("f", modifiers: [.command, .shift])
+            Divider()
+        }
         CommandMenu("전사") {
             Button(model.isRunning ? "정지" : "시작") { model.toggle() }
                 .keyboardShortcut("r", modifiers: .command)
@@ -210,14 +254,25 @@ struct TranscriptCommands: Commands {
                 .keyboardShortcut("e", modifiers: .command)
                 .disabled(model.isBusy)
             Toggle("언어 자동 감지 (양방향)", isOn: $model.autoDetect)
+            Toggle("화자 구분 (목소리)", isOn: $model.diarize)
+                .onChange(of: model.diarize) { model.restartIfRunning() }
             Divider()
             Picker("입력 소스", selection: $model.inputKindRaw) {
                 ForEach(InputKind.allCases) { Text($0.rawValue).tag($0.rawValue) }
             }
             .disabled(model.isRunning)
+            Picker("음성 인식 엔진", selection: $model.sttEngineRaw) {
+                ForEach(STTEngineKind.allCases) { Text($0.rawValue).tag($0.rawValue) }
+            }
+            .disabled(model.isRunning)
             Picker("번역 엔진", selection: $model.translatorRaw) {
                 ForEach(TranslatorKind.allCases) { Text($0.rawValue).tag($0.rawValue) }
             }
+            Divider()
+            Button(overlay.isVisible ? "자막 창 숨기기" : "자막 창 보기") { OverlayController.shared.toggle(model: model) }
+                .keyboardShortcut("t", modifiers: .command)
+            Toggle("자막 창 클릭 통과", isOn: $model.overlayClickThrough)
+                .onChange(of: model.overlayClickThrough) { _, on in OverlayController.shared.applyClickThrough(on) }
             Divider()
             Toggle("자동 스크롤", isOn: $model.autoScroll)
                 .keyboardShortcut("j", modifiers: .command)
@@ -257,7 +312,8 @@ struct TranscriptTable: View {
                                 row(index: i, leftWidth: leftW) {
                                     SegmentText(text: seg.source, time: seg.time, showTime: model.showTimestamps,
                                                 badge: model.autoDetect || seg.sourceLang != model.sourceCode
-                                                    ? seg.sourceLang.uppercased() : nil)
+                                                    ? seg.sourceLang.uppercased() : nil,
+                                                speaker: seg.speaker)
                                 } right: {
                                     TranslationRow(seg: seg)
                                 }
@@ -274,7 +330,7 @@ struct TranscriptTable: View {
                                 row(index: model.segments.count, leftWidth: leftW) {
                                     // Held (waiting for sentence end) + live hypothesis.
                                     Text("\(Text(model.heldText).foregroundStyle(.secondary))\(model.heldText.isEmpty || model.volatileText.isEmpty ? "" : " ")\(Text(model.volatileText).italic().foregroundStyle(.tertiary))")
-                                        .font(.system(size: 15))
+                                        .font(model.font(model.transcriptFontSize))
                                         .frame(maxWidth: .infinity, alignment: .leading)
                                 } right: {
                                     Text("…").foregroundStyle(.tertiary)
@@ -312,15 +368,6 @@ struct TranscriptTable: View {
             ColumnHeader(title: "원문", langCode: $model.sourceCode, lockWhileRunning: true,
                          showAutoDetect: true, copy: { model.copy(model.sourceText) })
                 .frame(width: leftWidth)
-                .overlay(alignment: .trailing) {
-                    Button { model.swapLanguages() } label: { Image(systemName: "arrow.left.arrow.right") }
-                        .buttonStyle(.bordered).controlSize(.small)
-                        .help("원문 ⇄ 번역 언어 바꾸기 (⌘E)")
-                        .disabled(model.isBusy)
-                        .offset(x: 16)
-                        .zIndex(1)
-                }
-                .zIndex(1)
             // Drag to resize both columns together.
             Rectangle().fill(.separator).frame(width: 1)
                 .padding(.horizontal, 3).contentShape(Rectangle())
@@ -329,9 +376,15 @@ struct TranscriptTable: View {
                     ratio = min(0.8, max(0.2, (leftWidth + v.translation.width) / max(total, 1)))
                 })
                 .padding(.horizontal, -3)
-            ColumnHeader(title: "번역", langCode: $model.targetCode, lockWhileRunning: model.autoDetect,
-                         copy: { model.copy(model.translationText) })
-                .padding(.leading, 18)
+            HStack(spacing: 0) {
+                Button { model.swapLanguages() } label: { Image(systemName: "arrow.left.arrow.right") }
+                    .buttonStyle(.borderless)
+                    .help("원문 ⇄ 번역 언어 바꾸기 (⌘E)")
+                    .disabled(model.isBusy)
+                    .padding(.leading, 10)
+                ColumnHeader(title: "번역", langCode: $model.targetCode, lockWhileRunning: model.autoDetect,
+                             copy: { model.copy(model.translationText) })
+            }
         }
         .frame(height: 38)
         .background(.bar)
@@ -366,11 +419,11 @@ struct ColumnHeader: View {
                     .onChange(of: model.autoDetect) { model.restartIfRunning() }
             }
             Spacer()
-            Button { copy() } label: { Label("복사", systemImage: "doc.on.doc") }
-                .controlSize(.small)
+            Button { copy() } label: { Image(systemName: "doc.on.doc") }
+                .buttonStyle(.borderless)
                 .help("\(title) 전체를 클립보드로 복사")
         }
-        .padding(.leading, 12).padding(.trailing, 24)
+        .padding(.leading, 12).padding(.trailing, 14)
     }
 }
 
@@ -379,12 +432,22 @@ struct SegmentText: View {
     let time: Date
     var showTime = true
     var badge: String? = nil
+    var speaker: Int? = nil
+    @EnvironmentObject var model: AppModel
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {
             if showTime {
                 Text(AppModel.timeFormatter.string(from: time))
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.tertiary)
+            }
+            if let speaker {
+                Text(AppModel.speakerLabel(speaker))
+                    .font(.system(size: 10, weight: .semibold))
+                    .padding(.horizontal, 5).padding(.vertical, 1)
+                    .background(Capsule().fill(SpeakerColor.of(speaker).opacity(0.2)))
+                    .foregroundStyle(SpeakerColor.of(speaker))
+                    .fixedSize()
             }
             if let badge {
                 Text(badge)
@@ -394,7 +457,7 @@ struct SegmentText: View {
                     .foregroundStyle(Color.accentColor)
             }
             Text(text)
-                .font(.system(size: 15))
+                .font(model.font(model.transcriptFontSize))
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .textSelection(.enabled)
         }
@@ -417,7 +480,7 @@ struct TranslationRow: View {
                 }
             default:
                 Text(seg.translation.isEmpty ? "…" : seg.translation)
-                    .font(.system(size: 16, weight: .medium))
+                    .font(model.font(model.transcriptFontSize + 1, weight: .medium))
                     .foregroundStyle(seg.state == .translating ? .secondary : .primary)
                     .textSelection(.enabled)
             }
@@ -427,6 +490,11 @@ struct TranslationRow: View {
 }
 
 /// Shows whether audio is currently being recognized (pause / push-to-talk).
+enum SpeakerColor {
+    static let palette: [Color] = [.blue, .orange, .green, .pink, .purple, .teal, .yellow, .red]
+    static func of(_ i: Int) -> Color { palette[i % palette.count] }
+}
+
 struct ListeningBadge: View {
     @EnvironmentObject var model: AppModel
     var body: some View {
@@ -477,6 +545,37 @@ struct StatusBar: View {
 
 // MARK: - Settings
 
+/// "▾" next to a model field: lists the endpoint's models (`GET /models`) on open.
+struct ModelMenu: View {
+    let baseURL: String
+    let apiKey: String
+    @Binding var selection: String
+    var filter: (String) -> Bool = { _ in true }
+    @EnvironmentObject var model: AppModel
+    @State private var models: [String] = []
+    @State private var loading = false
+
+    var body: some View {
+        Menu {
+            if loading { Text("불러오는 중…") }
+            else if models.isEmpty { Button("목록 불러오기") { load() } }
+            ForEach(models.filter(filter), id: \.self) { m in
+                Button(m) { selection = m }
+            }
+            if !models.isEmpty { Divider(); Button("새로 고침") { load() } }
+        } label: { Image(systemName: "list.bullet") }
+        .menuIndicator(.hidden).fixedSize()
+        .disabled(baseURL.trimmingCharacters(in: .whitespaces).isEmpty)
+        .help("엔드포인트의 모델 목록에서 고르기")
+        .onAppear { if models.isEmpty && !baseURL.isEmpty { load() } }
+    }
+
+    private func load() {
+        loading = true
+        Task { models = await model.fetchModels(baseURL: baseURL, apiKey: apiKey); loading = false }
+    }
+}
+
 struct SettingsView: View {
     @EnvironmentObject var model: AppModel
     var body: some View {
@@ -485,7 +584,10 @@ struct SettingsView: View {
                 Section("OpenAI 호환 LLM API") {
                     TextField("Base URL", text: $model.llmBaseURL, prompt: Text("https://host/v1"))
                     SecureField("API Key", text: $model.llmAPIKey)
-                    TextField("Model", text: $model.llmModel)
+                    HStack {
+                        TextField("Model", text: $model.llmModel)
+                        ModelMenu(baseURL: model.llmBaseURL, apiKey: model.llmAPIKey, selection: $model.llmModel)
+                    }
                     HStack {
                         Text("Temperature \(model.llmTemperature, specifier: "%.2f")")
                         Slider(value: $model.llmTemperature, in: 0...1)
@@ -496,9 +598,47 @@ struct SettingsView: View {
                 Section("Google 번역") {
                     SecureField("Cloud Translation API Key (비우면 무료 엔드포인트)", text: $model.googleAPIKey)
                 }
+                Section {
+                    Button("~/env 의 LiteLLM 설정 불러오기") { model.loadLiteLLMEnv(overwrite: true) }
+                    Text("LITELLM_OPENAI_BASE_URL / LITELLM_OPENAI_API_KEY 를 LLM 번역과 Whisper 양쪽에 채웁니다. 비어 있는 칸은 앱 시작 시 자동으로 채워집니다.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
             .formStyle(.grouped)
             .tabItem { Label("번역", systemImage: "globe") }
+
+            Form {
+                Section("엔진") {
+                    Picker("음성 인식", selection: $model.sttEngineRaw) {
+                        ForEach(STTEngineKind.allCases) { Text($0.rawValue).tag($0.rawValue) }
+                    }
+                    .disabled(model.isRunning)
+                    Text("Apple: 온디바이스·실시간 미리보기. Whisper: 말이 끊길 때마다 구간을 API로 보내 인식합니다 (1~2초 늦지만 정확, 언어 자동 감지도 Whisper가 직접 합니다).")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Section("화자 구분 (실험적)") {
+                    Toggle("목소리로 화자를 구분해서 '화자 1/2/3' 표시", isOn: $model.diarize)
+                    HStack {
+                        Text("같은 사람 판정 기준 \(model.speakerThreshold, specifier: "%.2f")")
+                        Slider(value: $model.speakerThreshold, in: 0.5...0.9)
+                    }
+                    .disabled(!model.diarize)
+                    Text("발화마다 기기 안에서 목소리 특징(CAM++, 약 17MB, 처음 켤 때 다운로드)을 뽑아 비슷한 목소리끼리 묶습니다. 한 사람이 여러 화자로 나뉘면 기준을 낮추고, 다른 사람이 한 화자로 합쳐지면 높이세요. 다음 시작부터 적용됩니다.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Section("Whisper API (OpenAI 호환 /audio/transcriptions)") {
+                    TextField("Base URL", text: $model.whisperBaseURL, prompt: Text("https://host/v1"))
+                    SecureField("API Key", text: $model.whisperAPIKey)
+                    HStack {
+                        TextField("Model", text: $model.whisperModel)
+                        ModelMenu(baseURL: model.whisperBaseURL, apiKey: model.whisperAPIKey,
+                                  selection: $model.whisperModel, filter: { $0.localizedCaseInsensitiveContains("whisper") })
+                    }
+                    Button("~/env 에서 불러오기") { model.loadLiteLLMEnv(overwrite: true) }
+                }
+            }
+            .formStyle(.grouped)
+            .tabItem { Label("음성 인식", systemImage: "waveform.badge.mic") }
 
             Form {
                 Section("대화 맥락 / 용어집") {
@@ -532,6 +672,27 @@ struct SettingsView: View {
                     Toggle("각 줄에 시간 표시", isOn: $model.showTimestamps)
                     Toggle("텍스트 복사 시 [HH:mm:ss] 포함", isOn: $model.copyTimestamps)
                 }
+                Section("글꼴") {
+                    Picker("글꼴", selection: $model.fontFamily) {
+                        Text("시스템 기본").tag("")
+                        Divider()
+                        ForEach(NSFontManager.shared.availableFontFamilies, id: \.self) { f in
+                            Text(f).font(.custom(f, size: 13)).tag(f)
+                        }
+                    }
+                    HStack { Text("대본 글자 크기 \(Int(model.transcriptFontSize)) pt (⌘= / ⌘-)"); Slider(value: $model.transcriptFontSize, in: 10...32, step: 1) }
+                    Text("원문·번역 텍스트와 자막 창에 같이 적용됩니다.").font(.caption).foregroundStyle(.secondary)
+                }
+                Section("자막 창 (⌘T)") {
+                    HStack { Text("글자 크기 \(Int(model.overlayFontSize)) pt (⌥⌘= / ⌥⌘-)"); Slider(value: $model.overlayFontSize, in: 14...96, step: 1) }
+                    HStack { Text("전체 화면 배율 ×\(model.overlayFullScreenScale, specifier: "%.1f") (⌘⇧F, 더블클릭)"); Slider(value: $model.overlayFullScreenScale, in: 1...3, step: 0.1) }
+                    Stepper("표시 줄 수: \(model.overlayLines)", value: $model.overlayLines, in: 1...4)
+                    HStack { Text("배경 불투명도 \(Int(model.overlayOpacity * 100))%"); Slider(value: $model.overlayOpacity, in: 0...1) }
+                    Picker("배치", selection: $model.overlayLayoutRaw) {
+                        ForEach(OverlayLayout.allCases) { Text($0.rawValue).tag($0.rawValue) }
+                    }
+                    Toggle("클릭 통과 (아래 앱을 그대로 조작)", isOn: $model.overlayClickThrough)
+                }
                 Section("녹음 / 저장") {
                     Picker("녹음 포맷", selection: $model.recordFormatRaw) {
                         ForEach(RecordFormat.allCases) { Text($0.rawValue).tag($0.rawValue) }
@@ -547,6 +708,6 @@ struct SettingsView: View {
             .formStyle(.grouped)
             .tabItem { Label("오디오", systemImage: "waveform") }
         }
-        .frame(width: 560, height: 460)
+        .frame(width: 580, height: 480)
     }
 }
