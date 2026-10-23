@@ -20,17 +20,53 @@ Live speech recognition + translation for macOS — native, on-device speech rec
 
 ## Install
 
-1. Download `tongyeok_<version>_macos_arm64.zip` from [Releases](https://github.com/ziozzang/tongyeok/releases/latest) and unzip.
-2. Move **Tongyeok.app** to `/Applications` (or `~/Applications`).
-3. The app is ad-hoc signed (not notarized). On first launch either right-click → **Open**, or run
-   `xattr -dr com.apple.quarantine /Applications/Tongyeok.app`
+```sh
+curl -fsSL https://raw.githubusercontent.com/ziozzang/tongyeok/main/install.sh | bash
+```
+
+Downloads the latest release, checks it against `SHA256SUMS`, installs to `/Applications` (or `~/Applications` if
+that isn't writable) and opens it. Run the same line again to update. Options: `TONGYEOK_VERSION=0.2.0`,
+`TONGYEOK_DIR=~/Applications`, `TONGYEOK_NO_OPEN=1` (put them before `bash`, e.g. `… | TONGYEOK_NO_OPEN=1 bash`).
 
 Requirements: macOS 26 (Tahoe) or later, Apple Silicon.
+
+<details><summary>Manual install</summary>
+
+1. Download `tongyeok_<version>_macos_arm64.zip` from [Releases](https://github.com/ziozzang/tongyeok/releases/latest).
+2. Unzip and move **Tongyeok.app** to `/Applications`.
+3. Clear the download flag (see below): `xattr -dr com.apple.quarantine /Applications/Tongyeok.app`
+</details>
+
+### "Tongyeok can't be opened" / "Apple could not verify…"
+
+Tongyeok is ad-hoc signed, not notarized by Apple. A browser-downloaded app carries a *quarantine* flag, and
+Gatekeeper refuses to open quarantined apps that aren't notarized. On macOS 15+ the old right-click → Open trick
+no longer works. Fix it either way:
+
+- install with the one-liner above (curl sets no quarantine flag), or
+- `xattr -dr com.apple.quarantine /Applications/Tongyeok.app`, or
+- System Settings → Privacy & Security → scroll down → **Open Anyway** (after one blocked launch attempt).
+
+The in-app updater clears the flag on updates itself.
+
+### Permission prompts after an update
+
+macOS ties privacy permissions to the app's code signature, and an ad-hoc signature changes with every build.
+So after an update you may be asked again for:
+
+- **Microphone**, and **Screen & System Audio Recording** (system audio input) — allow, then restart the app if
+  system audio stays silent (System Settings → Privacy & Security → Screen & System Audio Recording);
+- **Keychain** access to the saved API keys ("Tongyeok wants to use … net.jioh.stttrans") — choose
+  *Always Allow*. All keys are in one Keychain item, so it's a single prompt.
+
+Uninstall: `rm -rf /Applications/Tongyeok.app ~/Library/Application\ Support/Tongyeok` and
+`defaults delete net.jioh.stttrans`; the API keys are under `net.jioh.stttrans` in Keychain Access.
 
 ## Updates
 
 The app checks GitHub Releases once a day (and via **Check for Updates…**). Updates are verified against the
 release's `SHA256SUMS`, installed in place and the app relaunches. Set `NO_UPDATE_CHECK=1` to disable.
+Command line: `Tongyeok.app/Contents/MacOS/Tongyeok --update [--check]`.
 
 ## Build & release
 
