@@ -33,6 +33,14 @@ final class AppModel: ObservableObject {
     @AppStorage("llmHistory") var llmHistory = 6
     @AppStorage("llmSystemAsUser") var llmSystemAsUser = false
     @AppStorage("googleAPIKey") var googleAPIKey = ""
+    // Meeting minutes (LLM, uses the LLM endpoint/key)
+    @AppStorage("autoMinutes") var autoMinutes = true
+    @AppStorage("minutesMinSegments") var minutesMinSegments = 5
+    @AppStorage("minutesModel") var minutesModel = "deepseek-v4.1-flash"
+    @AppStorage("minutesLang") var minutesLang = "ko"
+    @AppStorage("minutesInstructions") var minutesInstructions = ""
+    @AppStorage("minutesEmail") var minutesEmail = true
+    @AppStorage("minutesRecipients") var minutesRecipients = ""
     /// Voice-based speaker labeling (CAM++ embedding per utterance + online clustering).
     @AppStorage("diarize") var diarize = false
     @AppStorage("speakerThreshold") var speakerThreshold = 0.7
@@ -90,6 +98,11 @@ final class AppModel: ObservableObject {
     @Published var confirmReset = false
     @Published var isPaused = false      // 상시 mode: temporarily not recognizing
     @Published var pttHeld = false       // push-to-talk key is down
+    @Published var isMakingMinutes = false
+    @Published var lastMinutes: URL?
+    /// One file name per session (since the last reset): regenerating minutes overwrites them.
+    private var sessionStamp: String?
+    private var sessionStart: Date?
 
     /// Whether audio currently goes to the recognizer.
     var isListening: Bool { listenMode == .always ? !isPaused : pttHeld }
@@ -212,8 +225,11 @@ final class AppModel: ObservableObject {
                 engine.captureUtterances = self.diarizer != nil
                 let src: AudioSource
                 if let testFile = ProcessInfo.processInfo.environment["STTTRANS_TEST_FILE"] {
-                    // Debug hook: feed an audio file in real time instead of a live source.
-                    src = FileSource(url: URL(fileURLWithPath: testFile))
+                    // Debug hook: feed an audio file in real time instead of a live source;
+                    // when it ends, stop like the user would (so the minutes run too).
+                    let file = FileSource(url: URL(fileURLWithPath: testFile))
+                    file.onFinished = { Task { @MainActor in try? await Task.sleep(for: .seconds(4)); self.stop() } }
+                    src = file
                 } else {
                     src = input == .microphone ? MicrophoneSource() : SystemAudioSource()
                 }
@@ -247,9 +263,13 @@ final class AppModel: ObservableObject {
         Task { await stopAndWait(); start() }
     }
 
+    /// User-initiated stop: also writes the minutes (if enabled and the session is long enough).
     func stop() {
         guard isRunning, !isBusy else { return }
-        Task { await stopAndWait() }
+        Task {
+            await stopAndWait()
+            if autoMinutes && segments.count >= minutesMinSegments { await makeMinutes() }
+        }
     }
 
     func stopAndWait() async {
@@ -276,6 +296,7 @@ final class AppModel: ObservableObject {
         volatileText = ""
         held = nil; heldText = ""; holdGeneration += 1; lastSoft = nil
         speakerSpans.removeAll()
+        sessionStamp = nil; sessionStart = nil; lastMinutes = nil
         if let d = diarizer { Task { await d.reset() } }
         lastError = nil
         appleTranslator = AppleTranslator()
@@ -418,6 +439,7 @@ final class AppModel: ObservableObject {
     private func addSegment(_ text: String, lang: String, at: Date) -> UUID {
         // Auto-detect: translate into whichever of the pair was NOT spoken.
         let target = autoDetect ? (lang == sourceCode ? targetCode : sourceCode) : targetCode
+        if sessionStamp == nil { sessionStamp = Self.stamp(); sessionStart = at }
         var seg = Segment(time: at, source: text, sourceLang: lang, targetLang: target)
         seg.speaker = speaker(at: at)
         segments.append(seg)
@@ -516,19 +538,92 @@ final class AppModel: ObservableObject {
         NSPasteboard.general.setString(s, forType: .string)
     }
 
-    func saveTranscript() {
-        let dir = URL(fileURLWithPath: saveDir)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let url = dir.appendingPathComponent("\(Self.stamp())-transcript.md")
+    func transcriptMarkdown() -> String {
         let f = DateFormatter(); f.dateFormat = "HH:mm:ss"
         var md = "# Transcript (\(source.label) → \(target.label))\n\n"
         for s in segments {
             let who = s.speaker.map { " \(Self.speakerLabel($0))" } ?? ""
             md += "**[\(f.string(from: s.time))]\(who)** \(s.source)\n\n> \(s.translation)\n\n"
         }
-        try? md.write(to: url, atomically: true, encoding: .utf8)
+        return md
+    }
+
+    func saveTranscript() {
+        let dir = URL(fileURLWithPath: saveDir)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("\(sessionStamp ?? Self.stamp())-transcript.md")
+        try? transcriptMarkdown().write(to: url, atomically: true, encoding: .utf8)
         status = "저장됨: \(url.lastPathComponent)"
         NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    // MARK: Minutes
+
+    /// Writes `<session>-minutes.md` (+ the transcript next to it) and optionally opens a Mail draft.
+    func makeMinutes() async {
+        guard !isMakingMinutes, !segments.isEmpty else { return }
+        isMakingMinutes = true
+        defer { isMakingMinutes = false }
+        var gen = MinutesGenerator(baseURL: llmBaseURL, apiKey: llmAPIKey, model: minutesModel,
+                                   language: Language.byCode(minutesLang), extraInstructions: minutesInstructions)
+        // Debug hook: small chunks to exercise the long-meeting (map-reduce) path.
+        if let c = ProcessInfo.processInfo.environment["STTTRANS_MINUTES_CHUNK"].flatMap(Int.init) { gen.chunkChars = c }
+        let lines = segments.map {
+            MinutesGenerator.Line(time: $0.time, speaker: $0.speaker.map(Self.speakerLabel), lang: $0.sourceLang,
+                                  source: $0.source, translation: $0.translation)
+        }
+        let t0 = Date()
+        do {
+            let body = try await gen.generate(lines) { s in self.status = s }
+            let dir = URL(fileURLWithPath: saveDir)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let stamp = sessionStamp ?? Self.stamp()
+            let url = dir.appendingPathComponent("\(stamp)-minutes.md")
+            try (minutesHeader() + body + "\n").write(to: url, atomically: true, encoding: .utf8)
+            try? transcriptMarkdown().write(to: dir.appendingPathComponent("\(stamp)-transcript.md"),
+                                            atomically: true, encoding: .utf8)
+            lastMinutes = url
+            status = String(format: "회의록 저장됨: %@ (%.0f초)", url.lastPathComponent, Date().timeIntervalSince(t0))
+            dlog("minutes -> \(url.path)")
+            if minutesEmail { openMailDraft(body: body, attachment: url) }
+        } catch {
+            lastError = "회의록 작성 실패: \(error.localizedDescription)"
+            status = "회의록 실패"
+        }
+    }
+
+    private func minutesHeader() -> String {
+        let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd HH:mm"
+        let start = sessionStart ?? segments.first?.time ?? Date()
+        let mins = Int(((segments.last?.time ?? start).timeIntervalSince(start) / 60).rounded())
+        let speakers = Set(segments.compactMap(\.speaker)).count
+        var h = "# 회의록 — \(df.string(from: start))\n\n"
+        h += "- 길이: 약 \(max(mins, 1))분 · \(segments.count)문장"
+        if speakers > 0 { h += " · 화자 \(speakers)명 (목소리 자동 구분)" }
+        h += "\n- 자동 생성 (\(minutesModel)) — 음성 인식 기반이라 오류가 있을 수 있습니다.\n\n"
+        return h
+    }
+
+    var minutesSubject: String {
+        let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd HH:mm"
+        return "회의록 \(df.string(from: sessionStart ?? segments.first?.time ?? Date()))"
+    }
+
+    /// New message in the default mail app (recipients, subject, minutes as body, .md attached). Never sends.
+    func openMailDraft(body: String, attachment: URL) {
+        guard let service = NSSharingService(named: .composeEmail) else {
+            NSWorkspace.shared.activateFileViewerSelecting([attachment]); return
+        }
+        service.recipients = minutesRecipients.split(whereSeparator: { $0 == "," || $0 == ";" || $0 == " " })
+            .map(String.init).filter { $0.contains("@") }
+        service.subject = minutesSubject
+        let items: [Any] = [body, attachment]
+        if service.canPerform(withItems: items) {
+            service.perform(withItems: items)
+        } else {
+            lastError = "메일 앱으로 초안을 열 수 없습니다. 회의록 파일을 Finder에서 보여 드립니다."
+            NSWorkspace.shared.activateFileViewerSelecting([attachment])
+        }
     }
 
     static func stamp() -> String {

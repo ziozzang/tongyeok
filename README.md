@@ -13,6 +13,7 @@ Live speech recognition + translation for macOS — native, on-device speech rec
 - Low-quality recording (AAC 32 kbps or AIFF, 16 kHz mono)
 - Floating subtitle window (⌘T): original | translation side by side, resizable, click-through, full screen (⌘⇧F / double-click)
 - Speech recognition: Apple on-device, or Whisper via any OpenAI-compatible `/audio/transcriptions` (LiteLLM etc.)
+- Meeting minutes on stop (⇧⌘M anytime): summary, decisions, action items by speaker → Markdown + Mail draft
 - Experimental speaker labels by voice (CAM++ CoreML embedding, ~17 MB, downloaded on first use)
 - LiteLLM endpoint/key auto-filled from `~/env` (`LITELLM_OPENAI_BASE_URL`, `LITELLM_OPENAI_API_KEY`)
 
@@ -52,4 +53,5 @@ xcrun swiftc -O -target arm64-apple-macosx26.0 -o build/speakers Tests/speakers/
   Sources/Shared/{Speakers,Common,Translator}.swift && build/speakers Alice=a1.wav Bob=b1.wav Alice=a2.wav
 ```
 Debug hooks: `STTTRANS_DEBUG=1`, `STTTRANS_AUTOSTART=1`, `STTTRANS_TEST_FILE=<audio>`,
-`STTTRANS_SNAPSHOT_DIR=<dir>` (PNG of each window every 2 s), `STTTRANS_OVERLAY_FULLSCREEN=1`.
+`STTTRANS_SNAPSHOT_DIR=<dir>` (PNG of each window every 2 s), `STTTRANS_OVERLAY_FULLSCREEN=1`,
+`STTTRANS_MINUTES_CHUNK=<chars>` (force the chunked minutes path). With `STTTRANS_TEST_FILE` the app stops itself at the end of the file.

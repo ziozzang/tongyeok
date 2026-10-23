@@ -198,6 +198,12 @@ struct ContentView: View {
                 .help("클립보드로 복사")
                 Button { model.saveTranscript() } label: { Image(systemName: "square.and.arrow.down") }
                     .help("대본을 Markdown으로 저장 (⌘S)")
+                Button { Task { await model.makeMinutes() } } label: {
+                    if model.isMakingMinutes { ProgressView().controlSize(.small).frame(width: 16) }
+                    else { Image(systemName: "doc.text.magnifyingglass") }
+                }
+                .disabled(model.isMakingMinutes || model.segments.isEmpty)
+                .help("회의록 만들기 (⇧⌘M): 요약·결정 사항·할 일 → Markdown 저장 + 메일 초안")
                 Button { model.requestReset() } label: { Image(systemName: "arrow.counterclockwise") }
                     .help("리셋: 화면·번역 맥락 초기화, 인식 중이면 새 세션으로 재시작 (⌘K)")
                     .disabled(model.isBusy)
@@ -287,6 +293,10 @@ struct TranscriptCommands: Commands {
             Divider()
             Button("대본 저장") { model.saveTranscript() }
                 .keyboardShortcut("s", modifiers: .command)
+            Button(model.isMakingMinutes ? "회의록 작성 중…" : "회의록 만들기") { Task { await model.makeMinutes() } }
+                .keyboardShortcut("m", modifiers: [.command, .shift])
+                .disabled(model.isMakingMinutes || model.segments.isEmpty)
+            Toggle("정지하면 회의록 자동 작성", isOn: $model.autoMinutes)
         }
     }
 }
@@ -639,6 +649,36 @@ struct SettingsView: View {
             }
             .formStyle(.grouped)
             .tabItem { Label("음성 인식", systemImage: "waveform.badge.mic") }
+
+            Form {
+                Section("회의록") {
+                    Toggle("정지하면 자동으로 회의록 작성", isOn: $model.autoMinutes)
+                    Stepper("최소 \(model.minutesMinSegments)문장 이상일 때만", value: $model.minutesMinSegments, in: 1...100)
+                        .disabled(!model.autoMinutes)
+                    Picker("작성 언어", selection: $model.minutesLang) {
+                        ForEach(Language.all) { Text($0.label).tag($0.code) }
+                    }
+                    HStack {
+                        TextField("모델", text: $model.minutesModel)
+                        ModelMenu(baseURL: model.llmBaseURL, apiKey: model.llmAPIKey, selection: $model.minutesModel)
+                    }
+                    Text("번역 탭의 LLM 엔드포인트·키를 사용합니다. 요약 · 주요 논의 · 결정 사항 · 할 일(화자별) · 미해결 질문을 Markdown으로 저장 폴더에 저장합니다 (⇧⌘M으로 언제든 다시 만들기).")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Section("추가 지시 (선택)") {
+                    TextEditor(text: $model.minutesInstructions)
+                        .font(.system(size: 13)).frame(minHeight: 60)
+                    Text("예: \"할 일은 기한 순으로\", \"화자 1은 김팀장\", \"기술 용어는 영어 그대로\"")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Section("메일") {
+                    Toggle("회의록이 만들어지면 메일 초안 열기 (보내기는 직접)", isOn: $model.minutesEmail)
+                    TextField("받는 사람 (쉼표로 구분)", text: $model.minutesRecipients, prompt: Text("a@example.com, b@example.com"))
+                        .disabled(!model.minutesEmail)
+                }
+            }
+            .formStyle(.grouped)
+            .tabItem { Label("회의록", systemImage: "doc.text") }
 
             Form {
                 Section("대화 맥락 / 용어집") {
