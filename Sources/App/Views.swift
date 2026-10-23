@@ -4,7 +4,10 @@ import Translation
 final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var model: AppModel?
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    /// With the menu bar icon, closing the window keeps the app (and a running session) alive there.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        !(UserDefaults.standard.object(forKey: "showMenuBarIcon") as? Bool ?? true)
+    }
 
     private var keyMonitor: Any?
 
@@ -56,9 +59,12 @@ enum Main {
 struct STTTransApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var model = AppModel()
+    // Bound here, not through the model: an isInserted binding via the ObservableObject re-renders the
+    // scene on every model change, which re-inserts the item, which changes the model… (update loop).
+    @AppStorage("showMenuBarIcon") private var showMenuBarIcon = true
 
     var body: some Scene {
-        WindowGroup("Tongyeok") {
+        WindowGroup("Tongyeok", id: "main") {
             ContentView().environmentObject(model)
                 .frame(minWidth: 960, minHeight: 480)
                 .updatePrompt()
@@ -87,6 +93,11 @@ struct STTTransApp: App {
         }
         Settings {
             SettingsView().environmentObject(model)
+        }
+        MenuBarExtra(isInserted: $showMenuBarIcon) {
+            MenuBarMenu().environmentObject(model)
+        } label: {
+            MenuBarIcon(model: model)
         }
     }
 }
@@ -230,6 +241,49 @@ struct ContentView: View {
         .fixedSize(horizontal: false, vertical: true)
         .padding(.horizontal, 12).padding(.vertical, 8)
         .background(.bar)
+    }
+}
+
+struct MenuBarIcon: View {
+    @ObservedObject var model: AppModel
+    var body: some View {
+        Image(systemName: model.isRunning ? (model.isPaused ? "pause.circle" : "waveform.circle.fill") : "captions.bubble")
+    }
+}
+
+/// Top-right status menu: the everyday controls without opening the window.
+struct MenuBarMenu: View {
+    @EnvironmentObject var model: AppModel
+    @ObservedObject private var overlay = OverlayController.shared
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Text(model.isRunning ? (model.isPaused ? "일시정지됨" : "인식 중 · \(model.segments.count)문장") : "대기 중")
+        Divider()
+        Button(model.isRunning ? "정지" : "시작") { model.toggle() }
+            .disabled(model.isBusy)
+        if model.isRunning && model.listenMode == .always {
+            Button(model.isPaused ? "재개" : "일시정지") { model.togglePause() }
+        }
+        Picker("입력", selection: $model.inputKindRaw) {
+            ForEach(InputKind.allCases) { Text($0.rawValue).tag($0.rawValue) }
+        }
+        .disabled(model.isRunning)
+        Divider()
+        Button(overlay.isVisible ? "자막 창 숨기기" : "자막 창 보기") { OverlayController.shared.toggle(model: model) }
+        Button(overlay.isFullScreen ? "자막 전체 화면 끝내기" : "자막 전체 화면") {
+            OverlayController.shared.toggleFullScreen(model: model)
+        }
+        Button(model.isMakingMinutes ? "회의록 작성 중…" : "회의록 만들기") { Task { await model.makeMinutes() } }
+            .disabled(model.isMakingMinutes || model.segments.isEmpty)
+        if let m = model.lastMinutes {
+            Button("마지막 회의록 열기") { NSWorkspace.shared.open(m) }
+        }
+        Divider()
+        Button("Tongyeok 창 열기") { openWindow(id: "main"); NSApp.activate() }
+        SettingsLink { Text("설정…") }
+        Divider()
+        Button("종료") { NSApp.terminate(nil) }
     }
 }
 
@@ -739,6 +793,9 @@ struct SettingsView: View {
                     }
                     HStack { Text("대본 글자 크기 \(Int(model.transcriptFontSize)) pt (⌘= / ⌘-)"); Slider(value: $model.transcriptFontSize, in: 10...32, step: 1) }
                     Text("원문·번역 텍스트와 자막 창에 같이 적용됩니다.").font(.caption).foregroundStyle(.secondary)
+                }
+                Section("메뉴 막대") {
+                    Toggle("오른쪽 위 메뉴 막대에 아이콘 표시 (창을 닫아도 계속 실행)", isOn: $model.showMenuBarIcon)
                 }
                 Section("자막 창 (⌘T)") {
                     HStack { Text("글자 크기 \(Int(model.overlayFontSize)) pt (⌥⌘= / ⌥⌘-)"); Slider(value: $model.overlayFontSize, in: 14...96, step: 1) }

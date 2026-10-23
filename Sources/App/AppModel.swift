@@ -65,6 +65,7 @@ final class AppModel: ObservableObject {
     func font(_ size: Double, weight: Font.Weight = .regular) -> Font {
         fontFamily.isEmpty ? .system(size: size, weight: weight) : .custom(fontFamily, size: size).weight(weight)
     }
+    @AppStorage("showMenuBarIcon") var showMenuBarIcon = true
     // Floating subtitle overlay
     @AppStorage("overlayFullScreenScale") var overlayFullScreenScale = 1.6
     @AppStorage("overlayVisible") var overlayVisible = false
