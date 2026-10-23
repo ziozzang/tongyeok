@@ -34,9 +34,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Stop capture and finalize the recording file before quitting.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let model, model.isRunning else { return .terminateNow }
+        guard let model else { return .terminateNow }
+        guard model.isRunning else { MainActor.assumeIsolated { model.prepareForQuit() }; return .terminateNow }
         Task { @MainActor in
             await model.stopAndWait()
+            model.prepareForQuit()
             sender.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater
@@ -68,8 +70,13 @@ struct STTTransApp: App {
                     if ProcessInfo.processInfo.environment["STTTRANS_OVERLAY_FULLSCREEN"] != nil {
                         OverlayController.shared.toggleFullScreen(model: model)
                     }
-                    model.loadLiteLLMEnv()   // only fills empty endpoint/key fields
                     DebugSnapshots.startIfRequested()
+                    // Debug hook: answer the crash-recovery prompt automatically ("restore" / "discard").
+                    switch ProcessInfo.processInfo.environment["STTTRANS_AUTO_RECOVER"] {
+                    case "restore": model.restoreSession()
+                    case "discard": model.discardRecoverable()
+                    default: break
+                    }
                     // Debug hook: start listening on launch.
                     if ProcessInfo.processInfo.environment["STTTRANS_AUTOSTART"] != nil { model.start() }
                 }
@@ -96,6 +103,14 @@ struct ContentView: View {
             TranscriptTable()
             Divider()
             StatusBar()
+        }
+        .alert("이전 세션 복구", isPresented: Binding(get: { model.recoverable != nil }, set: { _ in })) {
+            Button("복구") { model.restoreSession() }
+            Button("버리기", role: .destructive) { model.discardRecoverable() }
+        } message: {
+            if let s = model.recoverable {
+                Text("앱이 정상적으로 종료되지 않았습니다. \(s.savedAt.formatted(date: .abbreviated, time: .shortened))까지의 \(s.segments.count)문장을 복구할까요? 버려도 사본은 저장 폴더에 남습니다.")
+            }
         }
         .confirmationDialog("리셋할까요?", isPresented: $model.confirmReset) {
             Button("리셋", role: .destructive) { model.reset() }
@@ -546,6 +561,8 @@ struct StatusBar: View {
                 Text(e).foregroundStyle(.red).lineLimit(2).textSelection(.enabled)
             }
             Spacer()
+            let backlog = model.translationBacklog
+            if backlog > 0 { Text("번역 대기 \(backlog)").foregroundStyle(.orange) }
             Text("\(model.segments.count) 문장").foregroundStyle(.secondary)
         }
         .font(.caption)

@@ -445,11 +445,22 @@ final class SpeechEngine: @unchecked Sendable {
     /// Emits the pending text of the best lane: confidence x "text really is in this lane's language".
     private func flushPending() {
         lock.lock()
+        // A lane that merely transliterated English speech ("Yes." -> "예스.") loses to the English lane,
+        // however confident it was.
+        var transliterating: Set<String> = []
+        if lanes.count > 1, let en = lanes.first(where: { $0.code.hasPrefix("en") }) {
+            for other in lanes where other !== en
+                && Transliteration.otherIsTransliteratedEnglish(en: en.candidate, other: other.candidate, otherCode: other.code) {
+                transliterating.insert(other.code)
+                dlog("lane \(other.code) transliterates English: '\(other.candidate)' ~ '\(en.candidate)'")
+            }
+        }
         var best: (text: String, code: String, score: Double, date: Date, conf: Double)?
         for lane in lanes {
             let text = lane.candidate
             guard Self.letterCount(text) > 0 else { continue }
-            let score = lanes.count == 1 ? 1 : lane.avgConfidence * LanguageID.match(text, lane.code)
+            var score = lanes.count == 1 ? 1 : lane.avgConfidence * LanguageID.match(text, lane.code)
+            if transliterating.contains(lane.code) { score *= 0.1 }
             dlog(String(format: "lane %@ conf=%.2f score=%.3f | %@", lane.code, lane.avgConfidence, score, text))
             let date = lane.firstStart.map(wallClock(for:)) ?? Date()
             if best == nil || score > best!.score { best = (text, lane.code, score, date, lane.avgConfidence) }
@@ -470,7 +481,9 @@ final class SpeechEngine: @unchecked Sendable {
         callbacks.volatile("")
         guard let best else { return }
         // Multi-lane: a low winning score means neither language model believed it -> noise.
-        let conf = lanes.count > 1 ? min(best.conf, best.score + 0.2) : best.conf
+        var conf = lanes.count > 1 ? min(best.conf, best.score + 0.2) : best.conf
+        // Another lane transliterated this very speech: it was real words, not noise, however unsure.
+        if !transliterating.isEmpty && best.code.hasPrefix("en") { conf = max(conf, 0.6) }
         if NoiseFilter.isNoise(best.text, confidence: conf) {
             dlog("noise dropped: '\(best.text)' conf=\(conf)")
             return

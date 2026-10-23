@@ -105,3 +105,72 @@ struct LiteLLMEnv {
         return LiteLLMEnv(baseURL: base, apiKey: vars["LITELLM_OPENAI_API_KEY"] ?? "")
     }
 }
+
+/// Two recognizers (e.g. EN + KO) on the same audio: when one *transliterates* the other language
+/// ("Yes." -> "예스.", "Hello everyone" -> "헬로 에브리원"), both texts sound alike. The spoken language is then
+/// the one whose text consists of real words / real grammar. Confidence alone can't tell these apart.
+enum Transliteration {
+    /// Rough pronunciation skeleton: romanize, keep consonant classes (b/p/f/v, t/d/th, k/g/c/q, s/z/j/ch, l/r…).
+    static func skeleton(_ text: String) -> [Character] {
+        let latin = (text.applyingTransform(.toLatin, reverse: false) ?? text)
+            .applyingTransform(.stripDiacritics, reverse: false)?.lowercased() ?? text.lowercased()
+        var out: [Character] = []
+        var prev: Character = " "
+        for c in latin {
+            let k: Character?
+            switch c {
+            case "b", "p", "f", "v": k = "P"
+            case "t", "d": k = "T"
+            case "k", "g", "c", "q", "x": k = "K"
+            case "s", "z", "j": k = "S"
+            case "l", "r": k = "L"
+            case "m": k = "M"
+            case "n": k = "N"
+            default: k = nil        // vowels, h, w, y, punctuation, digits
+            }
+            if let k, k != out.last || prev == " " { out.append(k) }   // collapse doubled consonants within a word
+            prev = c
+        }
+        return out
+    }
+
+    /// 0…1 similarity of two pronunciation skeletons (1 - normalized edit distance).
+    static func soundAlike(_ a: String, _ b: String) -> Double {
+        let x = skeleton(a), y = skeleton(b)
+        guard !x.isEmpty, !y.isEmpty else { return 0 }
+        var d = Array(0...y.count)
+        for i in 1...x.count {
+            var prevDiag = d[0]; d[0] = i
+            for j in 1...y.count {
+                let tmp = d[j]
+                d[j] = min(d[j] + 1, d[j - 1] + 1, prevDiag + (x[i - 1] == y[j - 1] ? 0 : 1))
+                prevDiag = tmp
+            }
+        }
+        return 1 - Double(d[y.count]) / Double(max(x.count, y.count))
+    }
+
+    private static let english = NLEmbedding.wordEmbedding(for: .english)
+
+    /// Share of the words that are real English words (vocabulary lookup).
+    static func englishWordRatio(_ text: String) -> Double {
+        let words = text.lowercased().split { !$0.isLetter && $0 != "'" }.map { $0.replacingOccurrences(of: "'s", with: "") }
+            .filter { !$0.isEmpty }
+        guard !words.isEmpty, let e = english else { return 0 }
+        return Double(words.filter { e.contains($0) }.count) / Double(words.count)
+    }
+
+    /// Korean particles / sentence endings that transliterated English never has.
+    private static let koGrammar = ["은", "는", "을", "를", "에서", "에게", "이랑", "하고", "부터", "까지", "으로", "니다", "세요", "어요", "아요", "해요", "이에요", "예요", "죠", "까요", "네요", "었", "았", "겠"]
+    static func hasKoreanGrammar(_ text: String) -> Bool {
+        text.split { !$0.isLetter }.contains { w in w.count >= 2 && koGrammar.contains { w.hasSuffix($0) || w.contains($0) && $0.count >= 2 } }
+    }
+
+    /// Given the English lane's and another lane's text for the same audio: is the other lane just
+    /// transliterating English speech?
+    static func otherIsTransliteratedEnglish(en: String, other: String, otherCode: String) -> Bool {
+        guard soundAlike(en, other) >= 0.4, englishWordRatio(en) >= 0.75 else { return false }
+        if otherCode.hasPrefix("ko") && hasKoreanGrammar(other) { return false }
+        return true
+    }
+}

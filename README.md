@@ -15,6 +15,7 @@ Live speech recognition + translation for macOS — native, on-device speech rec
 - Speech recognition: Apple on-device, or Whisper via any OpenAI-compatible `/audio/transcriptions` (LiteLLM etc.)
 - Meeting minutes on stop (⇧⌘M anytime): summary, decisions, action items by speaker → Markdown + Mail draft
 - Experimental speaker labels by voice (CAM++ CoreML embedding, ~17 MB, downloaded on first use)
+- API keys in the Keychain (one item; ad-hoc signed updates ask for access once); transcript autosaved and offered back after a crash
 - LiteLLM endpoint/key auto-filled from `~/env` (`LITELLM_OPENAI_BASE_URL`, `LITELLM_OPENAI_API_KEY`)
 
 ## Install
@@ -42,7 +43,7 @@ Release assets follow the same scheme as [sugyeol](https://github.com/ziozzang/s
 ## Tests
 
 ```sh
-xcrun swiftc -target arm64-apple-macosx26.0 -o build/unit Tests/unit/main.swift Sources/Shared/SentenceAssembler.swift && build/unit
+xcrun swiftc -target arm64-apple-macosx26.0 -o build/unit Tests/unit/main.swift Sources/Shared/{SentenceAssembler,Common,Translator}.swift && build/unit
 xcrun swiftc -O -target arm64-apple-macosx26.0 -o build/cli Tests/cli/main.swift \
   Sources/App/{SpeechEngine,AudioSource}.swift Sources/Shared/{Common,Translator,SentenceAssembler,VAD}.swift
 say -o /tmp/t.aiff "Hello everyone. [[slnc 1500]] Let's begin." && STTTRANS_DEBUG=1 build/cli /tmp/t.aiff en-US google ko
@@ -54,4 +55,6 @@ xcrun swiftc -O -target arm64-apple-macosx26.0 -o build/speakers Tests/speakers/
 ```
 Debug hooks: `STTTRANS_DEBUG=1`, `STTTRANS_AUTOSTART=1`, `STTTRANS_TEST_FILE=<audio>`,
 `STTTRANS_SNAPSHOT_DIR=<dir>` (PNG of each window every 2 s), `STTTRANS_OVERLAY_FULLSCREEN=1`,
-`STTTRANS_MINUTES_CHUNK=<chars>` (force the chunked minutes path). With `STTTRANS_TEST_FILE` the app stops itself at the end of the file.
+`STTTRANS_MINUTES_CHUNK=<chars>` (force the chunked minutes path), `STTTRANS_NO_KEYCHAIN=1` (keys in memory only),
+`STTTRANS_FAIL_TRANSLATIONS=<n>` / `STTTRANS_TRANSLATE_DELAY=<sec>` (inject translation faults / backlog),
+`STTTRANS_AUTO_RECOVER=restore|discard` (answer the crash-recovery prompt). With `STTTRANS_TEST_FILE` the app stops itself at the end of the file.

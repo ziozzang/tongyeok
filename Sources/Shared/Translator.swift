@@ -47,6 +47,26 @@ struct TranslationRequest {
     let userContext: String
 }
 
+/// Non-2xx from a translation API; 408/429/5xx are worth retrying.
+struct HTTPStatusError: LocalizedError {
+    let service: String
+    let status: Int
+    let body: String
+    var errorDescription: String? { "\(service) HTTP \(status)" + (body.isEmpty ? "" : ": \(body)") }
+    var isTransient: Bool { status == 408 || status == 429 || status >= 500 }
+}
+
+enum RetryPolicy {
+    /// Network hiccups and overloaded servers -- not bad config (missing endpoint, 401, 404…).
+    static func isTransient(_ error: Error) -> Bool {
+        if let h = error as? HTTPStatusError { return h.isTransient }
+        if let u = error as? URLError {
+            return ![.cancelled, .badURL, .unsupportedURL, .userAuthenticationRequired].contains(u.code)
+        }
+        return false
+    }
+}
+
 protocol Translator {
     func translate(_ req: TranslationRequest, onPartial: @escaping (String) -> Void) async throws -> String
 }
@@ -137,7 +157,7 @@ final class LLMTranslator: Translator {
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             var errText = ""
             for try await line in bytes.lines { errText += line; if errText.count > 800 { break } }
-            throw AppError.translate("LLM HTTP \(http.statusCode): \(errText)")
+            throw HTTPStatusError(service: "LLM", status: http.statusCode, body: errText)
         }
 
         var output = ""
@@ -246,7 +266,7 @@ final class GoogleTranslator: Translator {
             "q": r.text, "source": r.source.googleCode, "target": r.target.googleCode, "format": "text"])
         let (data, resp) = try await URLSession.shared.data(for: req)
         if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
-            throw AppError.translate("Google HTTP \(http.statusCode): \(String(data: data, encoding: .utf8) ?? "")")
+            throw HTTPStatusError(service: "Google", status: http.statusCode, body: String(data: data, encoding: .utf8) ?? "")
         }
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let d = json["data"] as? [String: Any], let ts = d["translations"] as? [[String: Any]],
@@ -262,7 +282,7 @@ final class GoogleTranslator: Translator {
                         .init(name: "q", value: r.text)]
         let (data, resp) = try await URLSession.shared.data(from: c.url!)
         if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
-            throw AppError.translate("Google HTTP \(http.statusCode)")
+            throw HTTPStatusError(service: "Google", status: http.statusCode, body: "")
         }
         guard let arr = try JSONSerialization.jsonObject(with: data) as? [Any],
               let parts = arr.first as? [Any] else { throw AppError.translate("Google 응답 파싱 실패") }

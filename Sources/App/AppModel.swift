@@ -7,8 +7,8 @@ enum ListenMode: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
-struct Segment: Identifiable, Equatable {
-    let id = UUID()
+struct Segment: Identifiable, Equatable, Codable {
+    var id = UUID()
     let time: Date
     var source: String
     var sourceLang: String   // detected / selected language of `source`
@@ -16,7 +16,7 @@ struct Segment: Identifiable, Equatable {
     var translation: String = ""
     var state: State = .queued
     var speaker: Int?        // 0-based voice cluster (speaker labeling), nil = unknown / off
-    enum State: Equatable { case queued, translating, done, failed(String) }
+    enum State: Equatable, Codable { case queued, translating, done, failed(String) }
 }
 
 @MainActor
@@ -27,12 +27,13 @@ final class AppModel: ObservableObject {
     @AppStorage("targetLang") var targetCode = "ko"
     @AppStorage("translator") var translatorRaw = TranslatorKind.llm.rawValue
     @AppStorage("llmBaseURL") var llmBaseURL = ProcessInfo.processInfo.environment["STTTRANS_API_BASE"] ?? ""
-    @AppStorage("llmAPIKey") var llmAPIKey = ProcessInfo.processInfo.environment["STTTRANS_API_KEY"] ?? ""
+    // API keys: Keychain (SecretStore), loaded asynchronously at launch -- see loadSecrets().
+    @Published var llmAPIKey = "" { didSet { secretsChanged() } }
     @AppStorage("llmModel") var llmModel = ProcessInfo.processInfo.environment["STTTRANS_MODEL"] ?? "gemma-4-31b-it"
     @AppStorage("llmTemperature") var llmTemperature = 0.2
     @AppStorage("llmHistory") var llmHistory = 6
     @AppStorage("llmSystemAsUser") var llmSystemAsUser = false
-    @AppStorage("googleAPIKey") var googleAPIKey = ""
+    @Published var googleAPIKey = "" { didSet { secretsChanged() } }
     // Meeting minutes (LLM, uses the LLM endpoint/key)
     @AppStorage("autoMinutes") var autoMinutes = true
     @AppStorage("minutesMinSegments") var minutesMinSegments = 5
@@ -47,7 +48,7 @@ final class AppModel: ObservableObject {
     @AppStorage("sttEngine") var sttEngineRaw = STTEngineKind.apple.rawValue
     var sttEngine: STTEngineKind { STTEngineKind(rawValue: sttEngineRaw) ?? .apple }
     @AppStorage("whisperBaseURL") var whisperBaseURL = ""
-    @AppStorage("whisperAPIKey") var whisperAPIKey = ""
+    @Published var whisperAPIKey = "" { didSet { secretsChanged() } }
     @AppStorage("whisperModel") var whisperModel = "openai/whisper-large-v3"
     @AppStorage("userContext") var userContext = ""
     @AppStorage("vadMargin") var vadMargin = 9.0
@@ -83,7 +84,12 @@ final class AppModel: ObservableObject {
         .appendingPathComponent("STTTrans").path
 
     // Live state
-    @Published var segments: [Segment] = []
+    @Published var segments: [Segment] = [] { didSet { scheduleAutosave() } }
+    /// Unclean exit detected at launch: the session that can be restored (asks the user first).
+    @Published var recoverable: SavedSession?
+    private var autosavePending = false
+    /// Restored speakers keep their numbers; new voice clusters are numbered after them.
+    private var speakerOffset = 0
     @Published var volatileText = ""
     /// Incomplete sentence waiting for its continuation (shown in the live row).
     @Published var heldText = ""
@@ -138,7 +144,15 @@ final class AppModel: ObservableObject {
     /// Wall-clock spans of labeled utterances; recognized text is matched to them by start time.
     private var speakerSpans: [(start: Date, end: Date, speaker: Int)] = []
     private var translateQueue: [UUID] = []
-    private var translateTask: Task<Void, Never>?
+    /// Translation workers: 1 normally (keeps context ordered), up to 3 to catch up on a backlog.
+    private var translateWorkers: [Task<Void, Never>] = []
+    private var activeWorkers = 0
+    private var workerGeneration = 0
+    /// Debug hook (`STTTRANS_FAIL_TRANSLATIONS=n`): the first n translation attempts fail with HTTP 503.
+    private var injectedFailures = Int(ProcessInfo.processInfo.environment["STTTRANS_FAIL_TRANSLATIONS"] ?? "") ?? 0
+    /// Debug hook (`STTTRANS_TRANSLATE_DELAY=sec`): slow every translation down, to build a backlog.
+    private let injectedDelay = Double(ProcessInfo.processInfo.environment["STTTRANS_TRANSLATE_DELAY"] ?? "") ?? 0
+    var translationBacklog: Int { segments.filter { $0.state == .queued }.count }
     private var translator: Translator?
     private var appleTranslator = AppleTranslator()
 
@@ -148,6 +162,122 @@ final class AppModel: ObservableObject {
     var translatorKind: TranslatorKind { TranslatorKind(rawValue: translatorRaw) ?? .llm }
     var recordFormat: RecordFormat { RecordFormat(rawValue: recordFormatRaw) ?? .m4a }
 
+
+    // MARK: Secrets (Keychain)
+
+    private static let secretKeys = ["llmAPIKey", "googleAPIKey", "whisperAPIKey"]
+    private var secretsReady = false
+    private var secretsLoad: Task<Void, Never>?
+    private var secretsSaveTask: Task<Void, Never>?
+
+    init() {
+        secretsLoad = Task { await loadSecrets() }
+        if let s = SessionStore.load(), !s.segments.isEmpty { recoverable = s }
+    }
+
+    /// Keychain -> fields; first run after the update moves keys out of the preferences plist.
+    /// Then fills still-empty endpoints/keys from ~/env.
+    private func loadSecrets() async {
+        var s = await Task.detached { SecretStore.load() }.value
+        let defaults = UserDefaults.standard
+        var migrated = false
+        for k in Self.secretKeys {
+            if let old = defaults.string(forKey: k), !old.isEmpty {
+                if (s[k] ?? "").isEmpty { s[k] = old }
+                migrated = true
+            }
+        }
+        if (s["llmAPIKey"] ?? "").isEmpty, let env = ProcessInfo.processInfo.environment["STTTRANS_API_KEY"] {
+            s["llmAPIKey"] = env
+        }
+        llmAPIKey = s["llmAPIKey"] ?? ""
+        googleAPIKey = s["googleAPIKey"] ?? ""
+        whisperAPIKey = s["whisperAPIKey"] ?? ""
+        secretsReady = true
+        if migrated, !SecretStore.disabled, await Task.detached(operation: { [s] in SecretStore.save(s) }).value {
+            for k in Self.secretKeys { defaults.removeObject(forKey: k) }   // only once the Keychain has them
+            dlog("API keys migrated from preferences to Keychain")
+        }
+        loadLiteLLMEnv()
+    }
+
+    private func secretsChanged() {
+        guard secretsReady else { return }
+        let s = ["llmAPIKey": llmAPIKey, "googleAPIKey": googleAPIKey, "whisperAPIKey": whisperAPIKey]
+        secretsSaveTask?.cancel()
+        secretsSaveTask = Task {   // typing in a SecureField: write once it settles
+            try? await Task.sleep(for: .milliseconds(800))
+            guard !Task.isCancelled else { return }
+            _ = await Task.detached { SecretStore.save(s) }.value
+        }
+    }
+
+    // MARK: Autosave / recovery
+
+    private func scheduleAutosave() {
+        guard !autosavePending, recoverable == nil else { return }   // don't overwrite what's waiting to be restored
+        autosavePending = true
+        Task {
+            try? await Task.sleep(for: .seconds(2))   // at most every 2 s, also while translations stream in
+            autosavePending = false
+            writeAutosave()
+        }
+    }
+
+    private func writeAutosave() {
+        guard recoverable == nil else { return }
+        if segments.isEmpty { SessionStore.clear(); return }
+        let s = SavedSession(savedAt: Date(), sessionStamp: sessionStamp, sessionStart: sessionStart,
+                             sourceCode: sourceCode, targetCode: targetCode, segments: segments)
+        Task.detached { SessionStore.save(s) }
+    }
+
+    /// Bring back the crashed session; anything not translated yet goes back in the queue.
+    func restoreSession() {
+        guard let s = recoverable else { return }
+        recoverable = nil
+        segments = s.segments.map { seg in
+            var seg = seg
+            if seg.state == .translating { seg.state = .queued; seg.translation = "" }
+            return seg
+        }
+        sessionStamp = s.sessionStamp; sessionStart = s.sessionStart
+        speakerOffset = (segments.compactMap(\.speaker).max() ?? -1) + 1
+        status = "이전 세션 복구됨: \(segments.count)문장"
+        let pending = segments.filter { $0.state == .queued }.map(\.id)
+        Task {
+            await secretsLoad?.value
+            translateQueue.append(contentsOf: pending)
+            pumpTranslations()
+        }
+    }
+
+    /// Don't restore -- but keep a Markdown copy in the save folder so nothing is lost silently.
+    func discardRecoverable() {
+        guard let s = recoverable else { return }
+        recoverable = nil
+        let saved = segments
+        segments = s.segments
+        let dir = URL(fileURLWithPath: saveDir)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("\(s.sessionStamp ?? Self.stamp())-recovered-transcript.md")
+        try? transcriptMarkdown().write(to: url, atomically: true, encoding: .utf8)
+        segments = saved
+        SessionStore.clear()
+        status = "이전 세션을 버렸습니다 (사본: \(url.lastPathComponent))"
+    }
+
+    /// Normal quit: transcript -> save folder, then drop the crash autosave.
+    func prepareForQuit() {
+        guard recoverable == nil else { return }   // user hasn't decided yet: keep it for next launch
+        if !segments.isEmpty {
+            let dir = URL(fileURLWithPath: saveDir)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try? transcriptMarkdown().write(to: dir.appendingPathComponent("\(sessionStamp ?? Self.stamp())-transcript.md"),
+                                            atomically: true, encoding: .utf8)
+        }
+        SessionStore.clear()
+    }
 
     // MARK: LiteLLM (~/env)
 
@@ -159,8 +289,13 @@ final class AppModel: ObservableObject {
             if overwrite { lastError = "~/env 에서 LITELLM_OPENAI_BASE_URL 을 찾지 못했습니다." }
             return false
         }
-        if overwrite || llmBaseURL.isEmpty { llmBaseURL = env.baseURL; llmAPIKey = env.apiKey }
-        if overwrite || whisperBaseURL.isEmpty { whisperBaseURL = env.baseURL; whisperAPIKey = env.apiKey }
+        // Also fill a missing key when the endpoint is already the LiteLLM one.
+        if overwrite || llmBaseURL.isEmpty || (llmAPIKey.isEmpty && llmBaseURL == env.baseURL) {
+            llmBaseURL = env.baseURL; llmAPIKey = env.apiKey
+        }
+        if overwrite || whisperBaseURL.isEmpty || (whisperAPIKey.isEmpty && whisperBaseURL == env.baseURL) {
+            whisperBaseURL = env.baseURL; whisperAPIKey = env.apiKey
+        }
         if overwrite { status = "LiteLLM 설정을 ~/env 에서 불러왔습니다." }
         return true
     }
@@ -190,6 +325,15 @@ final class AppModel: ObservableObject {
         guard !isRunning, !isBusy else { return }
         isBusy = true
         lastError = nil
+        // Keys come from the Keychain asynchronously; don't build engines/translators with empty ones.
+        if !secretsReady, let load = secretsLoad {
+            Task { await load.value; self.startEngine() }
+        } else {
+            startEngine()
+        }
+    }
+
+    private func startEngine() {
         let callbacks = SpeechEngine.Callbacks(
             volatile: { t in Task { @MainActor in self.volatileText = t } },
             finalSegment: { t, lang, at in Task { @MainActor in self.receive(t, lang: lang, at: at) } },
@@ -290,13 +434,14 @@ final class AppModel: ObservableObject {
     /// and restarts the recognizer with a fresh session if it was running.
     func reset() {
         guard !isBusy else { return }
-        translateTask?.cancel()
-        translateTask = nil
+        translateWorkers.forEach { $0.cancel() }
+        translateWorkers.removeAll()
+        activeWorkers = 0; workerGeneration += 1
         translateQueue.removeAll()
         segments.removeAll()
         volatileText = ""
         held = nil; heldText = ""; holdGeneration += 1; lastSoft = nil
-        speakerSpans.removeAll()
+        speakerSpans.removeAll(); speakerOffset = 0
         sessionStamp = nil; sessionStart = nil; lastMinutes = nil
         if let d = diarizer { Task { await d.reset() } }
         lastError = nil
@@ -329,7 +474,8 @@ final class AppModel: ObservableObject {
     private func labelSpeaker(_ audio: [Float], start: Date, end: Date) {
         guard let d = diarizer else { return }
         Task {
-            guard let spk = await d.speaker(for: audio) else { return }
+            guard let cluster = await d.speaker(for: audio) else { return }
+            let spk = cluster + speakerOffset
             speakerSpans.append((start, end, spk))
             if speakerSpans.count > 2000 { speakerSpans.removeFirst(500) }
             // Text that arrived before its speaker was known.
@@ -470,13 +616,22 @@ final class AppModel: ObservableObject {
     }
 
     private func pumpTranslations() {
-        guard translateTask == nil else { return }
-        translateTask = Task {
-            while !translateQueue.isEmpty, !Task.isCancelled {
-                let id = translateQueue.removeFirst()
-                await translate(id)
-            }
-            if !Task.isCancelled { translateTask = nil }
+        // Apple's on-device session is one shared object: keep it serial.
+        let maxWorkers = translatorKind == .apple ? 1 : (translateQueue.count >= 3 ? 3 : 1)
+        while activeWorkers < maxWorkers && !translateQueue.isEmpty {
+            activeWorkers += 1
+            let gen = workerGeneration
+            if activeWorkers > 1 { dlog("translation backlog \(translateQueue.count): worker \(activeWorkers)") }
+            translateWorkers.append(Task {
+                while !translateQueue.isEmpty, !Task.isCancelled {
+                    let id = translateQueue.removeFirst()
+                    await translate(id)
+                }
+                if gen == workerGeneration {
+                    activeWorkers -= 1
+                    translateWorkers.removeAll { $0.isCancelled }
+                }
+            })
         }
     }
 
@@ -493,20 +648,34 @@ final class AppModel: ObservableObject {
                                      history: Array(history.suffix(20)), userContext: userContext)
         segments[idx].state = .translating
         let translator = makeTranslator()
-        do {
-            let result = try await translator.translate(req) { partial in
-                Task { @MainActor in
-                    if let i = self.current(id, source: seg.source) { self.segments[i].translation = partial }
+        let delays: [Double] = [1, 3]   // retries for transient failures (network, 429, 5xx)
+        for attempt in 0...delays.count {
+            do {
+                if injectedDelay > 0 { try? await Task.sleep(for: .seconds(injectedDelay)) }
+                if injectedFailures > 0 {
+                    injectedFailures -= 1
+                    throw HTTPStatusError(service: "LLM", status: 503, body: "injected")
                 }
-            }
-            if let i = current(id, source: seg.source) {
-                segments[i].translation = result
-                segments[i].state = .done
-                dlog("TR  \(seg.source) => \(result)")
-            }
-        } catch {
-            if let i = current(id, source: seg.source) {
-                segments[i].state = .failed(error.localizedDescription)
+                let result = try await translator.translate(req) { partial in
+                    Task { @MainActor in
+                        if let i = self.current(id, source: seg.source) { self.segments[i].translation = partial }
+                    }
+                }
+                if let i = current(id, source: seg.source) {
+                    segments[i].translation = result
+                    segments[i].state = .done
+                    dlog("TR  \(seg.source) => \(result)")
+                }
+                return
+            } catch {
+                guard current(id, source: seg.source) != nil, !Task.isCancelled else { return }  // merged / reset
+                if attempt < delays.count && RetryPolicy.isTransient(error) {
+                    dlog("TR  retry \(attempt + 1) after: \(error.localizedDescription)")
+                    try? await Task.sleep(for: .seconds(delays[attempt]))
+                    continue
+                }
+                if let i = current(id, source: seg.source) { segments[i].state = .failed(error.localizedDescription) }
+                return
             }
         }
     }
